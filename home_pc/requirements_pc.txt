@@ -1,0 +1,4 @@
+MetaTrader5>=5.0.45
+supabase>=2.4.0
+python-dotenv>=1.0.0
+rich>=13.7.0
