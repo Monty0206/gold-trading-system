@@ -23,11 +23,11 @@ HARD_RULES = {
 
 MODELS = {
     "macro_scout": "anthropic/claude-sonnet-4-6",
-    "technical_analyst": "anthropic/claude-opus-4-6",
+    "technical_analyst": "anthropic/claude-opus-4-7",
     "quant_reasoner": "deepseek/deepseek-r1",
     "bull_bear_debate": "google/gemini-2.5-pro",
     "risk_manager": "deepseek/deepseek-chat",
-    "final_executor": "anthropic/claude-opus-4-6",
+    "final_executor": "anthropic/claude-opus-4-7",
 }
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
