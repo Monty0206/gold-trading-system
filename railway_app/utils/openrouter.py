@@ -86,6 +86,43 @@ async def call_openrouter(
     return _extract_json(content)
 
 
+async def get_credits_info() -> dict:
+    """
+    Fetch API key usage from GET /api/v1/auth/key.
+    Returns usage_total (lifetime USD spent on this key), credits_remaining
+    (limit - usage if a key-level spending cap is set, else None), and limit.
+    Call twice — before and after a session — and diff usage_total to get exact cost.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{BASE_URL}/auth/key",
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+
+        usage = float(data.get("usage") or 0)
+        limit = data.get("limit")
+        credits_remaining = (float(limit) - usage) if limit is not None else None
+
+        return {
+            "usage_total": usage,
+            "limit": float(limit) if limit is not None else None,
+            "credits_remaining": credits_remaining,
+            "is_free_tier": bool(data.get("is_free_tier", False)),
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "usage_total": 0.0,
+            "limit": None,
+            "credits_remaining": None,
+            "is_free_tier": False,
+            "error": str(e),
+        }
+
+
 async def call_openrouter_text(
     model: str,
     system_prompt: str,

@@ -59,6 +59,32 @@ async def send_signal_alert(
     await _send_message(message)
 
 
+async def send_cost_alert(
+    session_cost: float,
+    total_today: float,
+    credits_remaining,   # float or None
+    days_remaining,      # float or None
+    session: str,
+    today_session_count: int,
+) -> None:
+    """Send a second Telegram message with the OpenRouter cost summary."""
+    cr_str = f"`${credits_remaining:.4f}`" if credits_remaining is not None else "`N/A — no key limit set`"
+    dr_str = f"`~{days_remaining:.0f} days`" if days_remaining is not None else "`N/A`"
+    sessions_note = f"({today_session_count} session{'s' if today_session_count != 1 else ''} today)"
+
+    message = (
+        f"💰 *SESSION COST SUMMARY*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*Session:* {session}\n"
+        f"Session cost:       `${session_cost:.4f}`\n"
+        f"Total today:        `${total_today:.4f}` _{sessions_note}_\n"
+        f"Credits remaining:  {cr_str}\n"
+        f"Days remaining:     {dr_str}\n"
+        f"_(at 2 sessions/day)_"
+    )
+    await _send_message(message)
+
+
 async def send_error_alert(error: str) -> None:
     await _send_message(f"⚠️ *SYSTEM ERROR*\n`{error}`")
 
