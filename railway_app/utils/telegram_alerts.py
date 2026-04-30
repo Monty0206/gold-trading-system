@@ -28,8 +28,8 @@ async def send_signal_alert(
             f"📊 *TRADE LEVELS*\n"
             f"Entry:    `${final.get('entry_price')}`\n"
             f"Stop:     `${final.get('stop_loss')}`\n"
-            f"TP1:      `${final.get('take_profit_1')}` _(R:R {final.get('rr_tp1')})_\n"
-            f"TP2:      `${final.get('take_profit_2')}` _(R:R {final.get('rr_tp2')})_\n"
+            f"TP1:      `${final.get('take_profit_1')}` (R:R {final.get('rr_tp1')})\n"
+            f"TP2:      `${final.get('take_profit_2')}` (R:R {final.get('rr_tp2')})\n"
             f"Lot Size: `{final.get('lot_size')}`\n"
             f"Risk:     `${final.get('risk_usd')}`\n\n"
             f"⚡ *MT5 EXECUTING NOW...*\n"
@@ -44,7 +44,7 @@ async def send_signal_alert(
             f"*Session:* {session}\n"
             f"*Reason:* {final.get('wait_reason', 'Setup not ready')}\n"
             f"*Green Votes:* {green_votes}/6\n\n"
-            f"_Next analysis at next session._"
+            f"Next analysis at next session."
         )
 
     else:
@@ -77,10 +77,10 @@ async def send_cost_alert(
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"*Session:* {session}\n"
         f"Session cost:       `${session_cost:.4f}`\n"
-        f"Total today:        `${total_today:.4f}` _{sessions_note}_\n"
+        f"Total today:        `${total_today:.4f}` {sessions_note}\n"
         f"Credits remaining:  {cr_str}\n"
         f"Days remaining:     {dr_str}\n"
-        f"_(at 2 sessions/day)_"
+        f"(at 2 sessions/day)"
     )
     await _send_message(message)
 
@@ -91,13 +91,24 @@ async def send_error_alert(error: str) -> None:
 
 async def _send_message(text: str) -> None:
     if not BOT_TOKEN or not CHAT_ID:
-        print(f"[Telegram] Token/ChatID not set — skipping alert.")
+        print("[Telegram] Token/ChatID not set — skipping alert.")
         return
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(
+            resp = await client.post(
                 f"{BASE_URL}/sendMessage",
                 json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
             )
+            if resp.status_code != 200:
+                print(f"[Telegram] HTTP {resp.status_code}: {resp.text}")
+                # Retry without Markdown if parse error
+                if resp.status_code == 400:
+                    resp2 = await client.post(
+                        f"{BASE_URL}/sendMessage",
+                        json={"chat_id": CHAT_ID, "text": text.replace("*", "").replace("`", "").replace("_", "")},
+                    )
+                    print(f"[Telegram] Plain-text retry: HTTP {resp2.status_code}")
+            else:
+                print("[Telegram] Message sent OK.")
     except Exception as e:
         print(f"[Telegram] Failed to send message: {e}")
