@@ -55,6 +55,41 @@ async def run_gold_sniper() -> None:
         sys.exit(0)
     print(f"Session: {session}")
 
+    # 1b. DAILY LOSS CIRCUIT BREAKER — abort BEFORE any agent runs if hit
+    try:
+        from datetime import date as _date
+        account_balance = float(os.getenv("ACCOUNT_BALANCE", "20.00"))
+        daily_stop_pct = 3.0  # matches HARD_RULES["max_daily_loss_pct"]
+        today_iso = _date.today().isoformat()
+        loss_rows = (
+            supabase.table("trade_outcomes")
+            .select("profit_usd")
+            .gte("created_at", f"{today_iso}T00:00:00")
+            .execute()
+        )
+        daily_loss_usd = sum(
+            abs(float(r.get("profit_usd") or 0))
+            for r in (loss_rows.data or [])
+            if float(r.get("profit_usd") or 0) < 0
+        )
+        daily_loss_pct = (daily_loss_usd / account_balance * 100) if account_balance > 0 else 0
+        if daily_loss_pct >= daily_stop_pct:
+            msg = (
+                f"DAILY STOP HIT — loss ${daily_loss_usd:.2f} "
+                f"({daily_loss_pct:.2f}%) >= {daily_stop_pct}%. Aborting session."
+            )
+            print(msg)
+            await send_error_alert(
+                f"🛑 DAILY STOP HIT\nLoss today: ${daily_loss_usd:.2f} "
+                f"({daily_loss_pct:.2f}% of ${account_balance:.2f})\n"
+                f"Aborting {session} session — no trades will be generated."
+            )
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"WARNING: Daily-loss check failed (continuing): {e}")
+
     # 2. SNAPSHOT OPENROUTER USAGE (before any agent calls)
     print("Snapshotting OpenRouter usage...")
     credits_before = await get_credits_info()
@@ -128,7 +163,7 @@ async def run_gold_sniper() -> None:
     except Exception as e:
         print(f"WARNING: Debate agent failed: {e}")
         debate = {
-            "vote": "YELLOW",
+            "vote": "RED",
             "winner": "DRAW",
             "conviction": "LOW",
             "agent": "BULL_BEAR_DEBATE",
@@ -146,7 +181,12 @@ async def run_gold_sniper() -> None:
     green_count = sum(1 for v in all_votes if v.get("vote") == "GREEN")
 
     risk = await run_risk_manager(
-        market_data, all_votes, green_count, account_state, memories["RISK_MANAGER"]
+        market_data,
+        all_votes,
+        green_count,
+        account_state,
+        memories["RISK_MANAGER"],
+        supabase=supabase,
     )
     print(f"   Risk:      {risk.get('vote')} — {risk.get('risk_assessment')}")
     if risk.get("rejection_reason"):

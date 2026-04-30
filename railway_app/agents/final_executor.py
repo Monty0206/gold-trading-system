@@ -23,11 +23,11 @@ LOSING PATTERNS: {losing_patterns}
 CURRENT ACCOUNT: ${account_balance}
 
 DECISION RULES:
-- 5/5 GREEN -> EXECUTE with full confidence
-- 4/5 GREEN -> EXECUTE (Risk Manager must be one of the 4)
-- 3/5 or fewer GREEN -> WAIT (log reason)
-- Risk Manager RED -> ABORT regardless of other votes
-- Daily loss limit hit -> ABORT regardless of setup
+- 5/5 GREEN → EXECUTE with full confidence
+- 4/5 GREEN → EXECUTE (Risk Manager must be one of the 4)
+- 3/5 or fewer GREEN → WAIT (log reason)
+- Risk Manager RED → ABORT regardless of other votes
+- Daily loss limit hit → ABORT regardless of setup
 
 Respond ONLY in valid JSON:
 {{

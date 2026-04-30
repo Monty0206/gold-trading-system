@@ -37,7 +37,7 @@ MEMORY CONTEXT: {memory_context}
 Respond ONLY in valid JSON — no markdown, no explanation outside JSON:
 {{
   "bias": "BULLISH|BEARISH|NEUTRAL",
-  "strength": 1,
+  "strength": 1-10,
   "key_drivers": ["driver1", "driver2", "driver3"],
   "risk_events_today": [{{"event": "name", "time_gmt": "HH:MM", "impact": "HIGH|MEDIUM"}}],
   "news_blackout_windows": ["HH:MM-HH:MM GMT"],

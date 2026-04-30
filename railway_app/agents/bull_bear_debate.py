@@ -16,7 +16,8 @@ Use hard evidence from the macro and technical data provided.
 Find every legitimate reason this trade SHOULD be taken.
 No wishful thinking — only evidence-based arguments.
 Give your top 5 bull arguments ranked by strength.
-Be concise and specific. Use data points."""
+
+ALL DATA: {all_prior_data}"""
 
 _BEAR_SYSTEM = """You are the BEAR ADVOCATE for this XAUUSD trade.
 Build the strongest possible case AGAINST this trade.
@@ -24,7 +25,8 @@ Challenge every assumption. Find every weakness.
 Your job is to PROTECT THE ACCOUNT from bad trades.
 Be ruthlessly critical. Find real reasons this could fail.
 Give your top 5 bear arguments ranked by strength.
-Be concise and specific. Use data points."""
+
+ALL DATA: {all_prior_data}"""
 
 _ADJUDICATOR_SYSTEM = """You received arguments from a Bull Advocate and Bear Advocate.
 Score each side 1-10 on evidence quality and argument strength.
@@ -83,11 +85,14 @@ async def run_bull_bear_debate(
         f"Build your case based on this evidence."
     )
 
+    bull_system = _BULL_SYSTEM.replace("{all_prior_data}", all_data_str[:3000])
+    bear_system = _BEAR_SYSTEM.replace("{all_prior_data}", all_data_str[:3000])
+
     # Step 1 — Bull arguments
     try:
         bull_args = await call_openrouter_text(
             model=MODEL,
-            system_prompt=_BULL_SYSTEM,
+            system_prompt=bull_system,
             user_message=user_for_advocates,
             temperature=0.2,
             max_tokens=1024,
@@ -99,7 +104,7 @@ async def run_bull_bear_debate(
     try:
         bear_args = await call_openrouter_text(
             model=MODEL,
-            system_prompt=_BEAR_SYSTEM,
+            system_prompt=bear_system,
             user_message=user_for_advocates,
             temperature=0.2,
             max_tokens=1024,
@@ -144,5 +149,5 @@ async def run_bull_bear_debate(
             "key_risk_identified": f"Debate agent error: {str(e)[:100]}",
             "debate_verdict": f"Adjudicator failed: {str(e)[:200]}",
             "agent": "BULL_BEAR_DEBATE",
-            "vote": "YELLOW",
+            "vote": "RED",
         }

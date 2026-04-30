@@ -43,7 +43,7 @@ ANALYSIS FRAMEWORK:
 
 6. ATR 14 (H1)
    - Used for stop loss sizing only
-   - SL = beyond swing high/low + (ATR x 0.5)
+   - SL = beyond swing high/low + (ATR × 0.5)
 
 7. SETUP GRADING
    A-Grade: 6/6 confluence, clear structure, obvious entry

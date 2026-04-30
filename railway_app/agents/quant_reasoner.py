@@ -37,7 +37,6 @@ YOUR CALCULATIONS:
    Macro BULLISH + Technical LONG = AGREE (trade valid)
    Macro BEARISH + Technical SHORT = AGREE (trade valid)
    Any mismatch = DISAGREE (do not trade)
-   NOTE: If macro/technical data shows "Not available" then mark as PENDING_VERIFICATION
 
 4. PROBABILITY SCORING
    AGREE + 6/6 confluence = 85
