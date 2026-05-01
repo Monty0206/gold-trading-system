@@ -158,7 +158,7 @@ def push_candles(symbol: str) -> bool:
     rates_4h  = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4,  0, H4_BARS)
 
     if rates_15m is None or len(rates_15m) < 10:
-        print(f"[Pusher] Insufficient M15 data ({rates_15m and len(rates_15m) or 0} bars)")
+        print(f"[Pusher] Insufficient M15 data ({len(rates_15m) if rates_15m is not None else 0} bars)")
         return False
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -194,7 +194,9 @@ def push_candles(symbol: str) -> bool:
     print(
         f"[Pusher] {now_iso[:19]}Z  bid={bid}  ask={ask}  "
         f"spread={spread_pips}pips  "
-        f"M15={len(rates_15m)}  H1={len(rates_1h or [])}  H4={len(rates_4h or [])}"
+        f"M15={len(rates_15m)}  "
+        f"H1={len(rates_1h) if rates_1h is not None else 0}  "
+        f"H4={len(rates_4h) if rates_4h is not None else 0}"
     )
     return True
 
