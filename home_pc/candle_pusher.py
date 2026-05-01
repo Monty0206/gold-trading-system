@@ -19,7 +19,6 @@ Required Supabase table — run once in SQL editor:
     CREATE INDEX idx_live_market_data_pushed ON live_market_data(pushed_at DESC);
 """
 
-import json
 import os
 import signal
 import sys
@@ -169,9 +168,9 @@ def push_candles(symbol: str) -> bool:
         "bid":         bid,
         "ask":         ask,
         "spread_pips": spread_pips,
-        "candles_15m": json.dumps(_bars_to_json(rates_15m)),
-        "candles_1h":  json.dumps(_bars_to_json(rates_1h)),
-        "candles_4h":  json.dumps(_bars_to_json(rates_4h)),
+        "candles_15m": _bars_to_json(rates_15m),
+        "candles_1h":  _bars_to_json(rates_1h),
+        "candles_4h":  _bars_to_json(rates_4h),
     }
 
     supabase.table("live_market_data").insert(row).execute()

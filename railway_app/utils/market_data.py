@@ -15,6 +15,7 @@ Also fetches:
 """
 
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
 
@@ -53,21 +54,58 @@ def _ensure_utc(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_REQUIRED_OHLC = {"open", "high", "low", "close"}
+
+
+def _parse_candles(raw) -> list:
+    """Safely parse JSONB candle data that may arrive as a str, list, or None.
+
+    Supabase may return JSONB columns as a Python list (parsed) or as a JSON
+    string (if the value was inserted via json.dumps). Handle both.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"[MarketData] candle json.loads failed: {exc}")
+            return []
+    if not isinstance(raw, list):
+        print(f"[MarketData] unexpected candle type {type(raw)} — expected list")
+        return []
+    return raw
+
+
 def _json_to_df(candles: list) -> pd.DataFrame:
     """Convert a list of OHLC dicts (from Supabase/MT5 pusher) to a DataFrame."""
     if not candles:
         return pd.DataFrame()
-    df = pd.DataFrame(candles)
-    # Normalise column names to Title case
+
+    try:
+        df = pd.DataFrame(candles)
+    except Exception as exc:
+        print(f"[MarketData] pd.DataFrame(candles) failed: {exc}")
+        return pd.DataFrame()
+
+    cols_lower = {c.lower() for c in df.columns}
+    if not _REQUIRED_OHLC.issubset(cols_lower):
+        missing = _REQUIRED_OHLC - cols_lower
+        print(f"[MarketData] candle DataFrame missing columns: {missing}")
+        return pd.DataFrame()
+
+    # Normalise column names to Title case (Open, High, Low, Close)
     rename = {}
     for col in df.columns:
         if col.lower() in ("open", "high", "low", "close", "volume"):
             rename[col] = col.capitalize()
     if rename:
         df.rename(columns=rename, inplace=True)
+
     if "time" in df.columns:
-        df.index = pd.to_datetime(df["time"], utc=True)
+        df.index = pd.to_datetime(df["time"], unit="s", utc=True)
         df.sort_index(inplace=True)
+
     return df
 
 
@@ -221,10 +259,16 @@ def _fetch_sync(supabase=None) -> dict:
     live = _try_supabase_candles(supabase)
 
     if live is not None:
-        df_1h = _json_to_df(live.get("candles_1h") or [])
-        df_4h = _json_to_df(live.get("candles_4h") or [])
-        df_15m = _json_to_df(live.get("candles_15m") or [])
-        if df_1h.empty:
+        try:
+            df_1h  = _json_to_df(_parse_candles(live.get("candles_1h")))
+            df_4h  = _json_to_df(_parse_candles(live.get("candles_4h")))
+            df_15m = _json_to_df(_parse_candles(live.get("candles_15m")))
+        except Exception as exc:
+            print(f"[MarketData] Supabase candle parse error: {exc} — using yfinance fallback")
+            live = None
+            df_1h = df_4h = df_15m = pd.DataFrame()
+
+        if live is not None and df_1h.empty:
             print("[MarketData] Supabase 1H candles empty — using yfinance fallback")
             live = None
 
