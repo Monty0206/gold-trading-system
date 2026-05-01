@@ -282,7 +282,7 @@ def _fetch_sync(supabase=None) -> dict:
         if df_1h.empty:
             raise ValueError("yfinance returned empty 1H dataframe for GC=F")
 
-        # Staleness check: last candle must be within 6 hours
+        # Staleness check: last candle must be within 1 hour
         last_ts = df_1h.index[-1]
         age_h = (pd.Timestamp(now) - last_ts).total_seconds() / 3600
         if age_h > 1:
