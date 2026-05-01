@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -10,23 +11,21 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = "https://openrouter.ai/api/v1"
 HEADERS_BASE = {
-    "HTTP-Referer": "https://gold-session-sniper.railway.app",
     "X-Title": "Gold Session Sniper v2.0",
 }
+
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 def _extract_json(content: str) -> dict:
     """Extract JSON from model response, stripping think tags and markdown fences."""
-    # Strip DeepSeek R1 <think>...</think> reasoning tokens
     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
 
-    # Try direct parse
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
 
-    # Try JSON inside ```json ... ``` or ``` ... ``` fences
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
     if fence_match:
         try:
@@ -34,7 +33,6 @@ def _extract_json(content: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Try to find outermost { ... } block
     brace_match = re.search(r"\{[\s\S]*\}", content)
     if brace_match:
         try:
@@ -61,8 +59,58 @@ async def call_openrouter(
     user_message: str,
     temperature: float = 0.1,
     max_tokens: int = 4096,
+    timeout: float = 60.0,
 ) -> dict:
-    """Call OpenRouter and return a parsed JSON dict."""
+    """Call OpenRouter with retry on 429/5xx. Returns parsed JSON dict."""
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    }
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{BASE_URL}/chat/completions",
+                    headers=_build_headers(),
+                    json=payload,
+                )
+                if response.status_code in _RETRY_STATUSES:
+                    wait = 2 ** attempt
+                    print(f"[OpenRouter] HTTP {response.status_code} — retry {attempt+1}/3 in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+
+            content = data["choices"][0]["message"]["content"]
+            return _extract_json(content)
+
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            last_exc = e
+            wait = 2 ** attempt
+            print(f"[OpenRouter] Network error ({e}) — retry {attempt+1}/3 in {wait}s")
+            await asyncio.sleep(wait)
+
+    raise last_exc or RuntimeError("OpenRouter call failed after 3 retries")
+
+
+async def call_openrouter_text(
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+    timeout: float = 60.0,
+) -> str:
+    """Call OpenRouter and return raw text (used for Bull/Bear debate arguments)."""
     payload = {
         "model": model,
         "temperature": temperature,
@@ -73,26 +121,35 @@ async def call_openrouter(
         ],
     }
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            f"{BASE_URL}/chat/completions",
-            headers=_build_headers(),
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{BASE_URL}/chat/completions",
+                    headers=_build_headers(),
+                    json=payload,
+                )
+                if response.status_code in _RETRY_STATUSES:
+                    wait = 2 ** attempt
+                    print(f"[OpenRouter] HTTP {response.status_code} — retry {attempt+1}/3 in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+            return data["choices"][0]["message"]["content"]
 
-    content = data["choices"][0]["message"]["content"]
-    return _extract_json(content)
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            last_exc = e
+            wait = 2 ** attempt
+            print(f"[OpenRouter] Network error ({e}) — retry {attempt+1}/3 in {wait}s")
+            await asyncio.sleep(wait)
+
+    raise last_exc or RuntimeError("OpenRouter call failed after 3 retries")
 
 
 async def get_credits_info() -> dict:
-    """
-    Fetch API key usage from GET /api/v1/auth/key.
-    Returns usage_total (lifetime USD spent on this key), credits_remaining
-    (limit - usage if a key-level spending cap is set, else None), and limit.
-    Call twice — before and after a session — and diff usage_total to get exact cost.
-    """
+    """Fetch API key usage from GET /api/v1/auth/key."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
@@ -121,33 +178,3 @@ async def get_credits_info() -> dict:
             "is_free_tier": False,
             "error": str(e),
         }
-
-
-async def call_openrouter_text(
-    model: str,
-    system_prompt: str,
-    user_message: str,
-    temperature: float = 0.2,
-    max_tokens: int = 2048,
-) -> str:
-    """Call OpenRouter and return raw text (used for Bull/Bear debate arguments)."""
-    payload = {
-        "model": model,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-    }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            f"{BASE_URL}/chat/completions",
-            headers=_build_headers(),
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    return data["choices"][0]["message"]["content"]

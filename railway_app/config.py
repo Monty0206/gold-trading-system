@@ -1,4 +1,5 @@
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,15 +20,19 @@ HARD_RULES = {
     "min_green_votes": 4,
     "min_confluence": 4,
     "min_probability": 60,
+    "max_consecutive_losses": 3,         # kill switch after 3 consecutive losses
+    "no_trade_friday_after_hm": 14 * 60, # 14:00 UTC Friday cutoff (weekend gap risk)
 }
 
+# All OpenRouter model slugs in one place — agents import MODEL from here.
+# Never hard-code model strings in agent files.
 MODELS = {
-    "macro_scout": "anthropic/claude-sonnet-4-6",
-    "technical_analyst": "anthropic/claude-opus-4-7",
-    "quant_reasoner": "deepseek/deepseek-r1",
+    "macro_scout":      "anthropic/claude-sonnet-4-6",
+    "technical_analyst": "anthropic/claude-opus-4-6",
+    "quant_reasoner":   "deepseek/deepseek-chat",   # V3: fast arithmetic, no slow R1 reasoning
     "bull_bear_debate": "google/gemini-2.5-pro",
-    "risk_manager": "deepseek/deepseek-chat",
-    "final_executor": "anthropic/claude-opus-4-7",
+    "risk_manager":     "deepseek/deepseek-chat",
+    "final_executor":   "anthropic/claude-opus-4-6",
 }
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -42,3 +47,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MT5_LOGIN = os.getenv("MT5_LOGIN")
 MT5_PASSWORD = os.getenv("MT5_PASSWORD")
 MT5_SERVER = os.getenv("MT5_SERVER", "Deriv-Server")
+
+# Optional: FMP API key for real economic calendar (free tier: 250 calls/day).
+# Register at: https://financialmodelingprep.com/register
+# Add FMP_API_KEY to Railway env vars to enable real news events.
+# Without it, agents receive an empty calendar (LLM guesses news — less reliable).
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")

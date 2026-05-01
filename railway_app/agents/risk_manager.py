@@ -1,18 +1,19 @@
 """
 Agent 5 — Risk Manager
-Model: deepseek/deepseek-chat  |  Temp: 0.0
-Python hard rules are checked FIRST. AI does final sanity check second.
+Model: config.MODELS["risk_manager"]  |  Temp: 0.0
+Python hard rules run FIRST. AI sanity check only runs when Python rules PASS.
+Includes: 3-consecutive-loss kill switch, Friday cutoff, real news events.
 """
 
 import json
 import os
 from datetime import date, datetime, timezone
 
-from config import HARD_RULES
+from config import HARD_RULES, MODELS
 from utils.openrouter import call_openrouter
 from utils.session_guard import is_in_news_blackout
 
-MODEL = "deepseek/deepseek-chat"
+MODEL = MODELS["risk_manager"]
 
 _SYSTEM_TEMPLATE = """You are the Risk Manager and final gatekeeper.
 You protect the account above everything else.
@@ -23,11 +24,11 @@ PYTHON RULES RESULT: {hard_rules_result}
 ACCOUNT STATE: {account_state}
 ALL AGENT VOTES: {all_votes}
 
-If Python hard rules already REJECTED this trade → confirm REJECTED.
-If Python hard rules PASSED → do a final sanity check:
+Python hard rules have already PASSED. Do a final sanity check:
 - Does anything feel wrong that the rules didn't catch?
 - Is there unusual market context that increases risk?
 - Is the setup rushed or forced?
+- Does the macro-technical alignment look genuine?
 
 Respond ONLY in valid JSON:
 {{
@@ -52,7 +53,6 @@ Only GREEN if APPROVED. RED if any concern. No exceptions."""
 
 
 def _count_open_trades_today(supabase) -> int:
-    """Count signals already executed today (proxy for open trades)."""
     if supabase is None:
         return 0
     try:
@@ -70,7 +70,7 @@ def _count_open_trades_today(supabase) -> int:
 
 
 def _sum_daily_loss(supabase) -> float:
-    """Sum today's losses (positive number) from trade_outcomes."""
+    """Sum today's net loss (positive = net loss) from trade_outcomes."""
     if supabase is None:
         return 0.0
     try:
@@ -81,14 +81,33 @@ def _sum_daily_loss(supabase) -> float:
             .gte("created_at", f"{today_iso}T00:00:00")
             .execute()
         )
-        total_loss = 0.0
-        for r in rows.data or []:
-            p = float(r.get("profit_usd") or 0)
-            if p < 0:
-                total_loss += abs(p)
-        return total_loss
+        net = sum(float(r.get("profit_usd") or 0) for r in (rows.data or []))
+        return abs(net) if net < 0 else 0.0
     except Exception:
         return 0.0
+
+
+def _count_consecutive_losses(supabase) -> int:
+    """Count the most recent streak of consecutive LOSS outcomes."""
+    if supabase is None:
+        return 0
+    try:
+        rows = (
+            supabase.table("trade_outcomes")
+            .select("outcome")
+            .order("created_at", desc=True)
+            .limit(HARD_RULES["max_consecutive_losses"] + 1)
+            .execute()
+        )
+        count = 0
+        for r in (rows.data or []):
+            if r.get("outcome") == "LOSS":
+                count += 1
+            else:
+                break
+        return count
+    except Exception:
+        return 0
 
 
 def _check_python_hard_rules(
@@ -101,46 +120,44 @@ def _check_python_hard_rules(
     session: str,
     supabase=None,
 ) -> dict:
-    """Enforce hard rules in Python. Returns {passed, failed_rules}."""
+    """Enforce non-negotiable hard rules in Python. Returns {passed, failed_rules}."""
     failed = []
 
-    # Rule: Min green votes
+    # Min green votes
     if green_count < HARD_RULES["min_green_votes"]:
         failed.append(
             f"Only {green_count} GREEN votes — need {HARD_RULES['min_green_votes']}"
         )
 
-    # Rule: Min confluence score
+    # Min confluence score
     confluence = technical_output.get("confluence_score", 0)
     if confluence < HARD_RULES["min_confluence"]:
         failed.append(
             f"Confluence {confluence} < minimum {HARD_RULES['min_confluence']}"
         )
 
-    # Rule: No setup
+    # No setup
     if technical_output.get("setup_grade") == "NO_SETUP":
         failed.append("Technical grade is NO_SETUP")
 
-    # Rule: Min probability
+    # Min probability
     probability = quant_output.get("probability_score", 0)
     if probability < HARD_RULES["min_probability"]:
         failed.append(
             f"Probability {probability}% < minimum {HARD_RULES['min_probability']}%"
         )
 
-    # Rule: Min R:R
+    # Min R:R
     rr = quant_output.get("verified_rr_tp1", 0.0)
     if 0 < rr < HARD_RULES["min_rr_ratio"]:
         failed.append(f"R:R {rr:.2f} < minimum {HARD_RULES['min_rr_ratio']}")
 
-    # Rule: Max lot size
+    # Max lot size
     proposed_lot = quant_output.get("correct_lot_size", 0.01)
     if proposed_lot > HARD_RULES["max_lot_size"]:
-        failed.append(
-            f"Lot size {proposed_lot} > max {HARD_RULES['max_lot_size']}"
-        )
+        failed.append(f"Lot size {proposed_lot} > max {HARD_RULES['max_lot_size']}")
 
-    # Rule: Max risk pct (proposed risk_usd vs account balance)
+    # Max risk pct
     balance = float(account_state.get("balance", 20.0))
     proposed_risk_usd = float(quant_output.get("max_risk_usd", 0.0))
     proposed_risk_pct = (proposed_risk_usd / balance * 100) if balance > 0 else 0
@@ -149,14 +166,14 @@ def _check_python_hard_rules(
             f"Risk {proposed_risk_pct:.2f}% > max {HARD_RULES['max_risk_pct']}%"
         )
 
-    # Rule: Max open trades today
+    # Max open trades today
     open_today = _count_open_trades_today(supabase)
     if open_today >= HARD_RULES["max_open_trades"]:
         failed.append(
             f"Already {open_today} executed trades today — max {HARD_RULES['max_open_trades']}"
         )
 
-    # Rule: Max daily loss pct — circuit breaker
+    # Daily loss circuit breaker
     daily_loss = _sum_daily_loss(supabase)
     daily_loss_pct = (daily_loss / balance * 100) if balance > 0 else 0
     if daily_loss_pct >= HARD_RULES["max_daily_loss_pct"]:
@@ -165,21 +182,26 @@ def _check_python_hard_rules(
             f"max {HARD_RULES['max_daily_loss_pct']}% — DAILY STOP HIT"
         )
 
-    # Rule: Asian session blackout
+    # 3 consecutive losses kill switch
+    consecutive = _count_consecutive_losses(supabase)
+    if consecutive >= HARD_RULES["max_consecutive_losses"]:
+        failed.append(
+            f"{consecutive} consecutive losses — strategy pause (kill switch)"
+        )
+
+    # Session blackouts
     if session == "ASIAN" and HARD_RULES["no_trade_asian_session"]:
         failed.append("Asian session — no trading 00:00-07:00 GMT")
-
-    # Rule: Gap session blackout
     if session == "GAP" and HARD_RULES["no_trade_gap_session"]:
         failed.append("Gap session — no trading 12:00-12:45 GMT")
 
-    # Rule: News blackout (30 min before HIGH-impact events)
+    # News blackout — uses real FMP events if available, otherwise LLM's guess
     if is_in_news_blackout(news_events, HARD_RULES["no_trade_mins_before_news"]):
         failed.append(
             f"HIGH-impact news within {HARD_RULES['no_trade_mins_before_news']} minutes"
         )
 
-    # Rule: Math errors from quant
+    # Math errors from quant
     if quant_output.get("math_errors"):
         failed.append(f"Math errors detected: {quant_output['math_errors']}")
 
@@ -194,8 +216,7 @@ async def run_risk_manager(
     memory_context: str,
     supabase=None,
 ) -> dict:
-    """Run Risk Manager — Python rules first, then AI sanity check."""
-    # Extract individual agent outputs from the votes list
+    """Run Risk Manager — Python hard rules first, AI sanity check only if passed."""
     technical_output = next(
         (v for v in all_votes if v.get("agent") == "TECHNICAL_ANALYST"), {}
     )
@@ -206,10 +227,12 @@ async def run_risk_manager(
         (v for v in all_votes if v.get("agent") == "MACRO_SCOUT"), {}
     )
 
-    news_events = macro_output.get("risk_events_today", [])
+    # Use real FMP calendar from market_data if available, else fall back to LLM guess
+    calendar_events = market_data.get("economic_calendar") or []
+    news_events = calendar_events if calendar_events else macro_output.get("risk_events_today", [])
     session = account_state.get("session", "UNKNOWN")
 
-    # 1. Python hard rules — non-negotiable, run BEFORE any AI call
+    # 1. Python hard rules — non-negotiable
     hard_rules_result = _check_python_hard_rules(
         all_votes=all_votes,
         green_count=green_count,
@@ -221,8 +244,11 @@ async def run_risk_manager(
         supabase=supabase,
     )
 
-    # Build trade proposal summary
-    entry = technical_output.get("entry_zone_from") or technical_output.get("entry_zone_to") or 0
+    entry = (
+        technical_output.get("entry_zone_from")
+        or technical_output.get("entry_zone_to")
+        or 0
+    )
     trade_proposal = {
         "direction": "LONG" if technical_output.get("expected_breakout_direction") == "UP" else "SHORT",
         "entry_price": entry,
@@ -235,6 +261,27 @@ async def run_risk_manager(
         "setup_grade": technical_output.get("setup_grade", "NO_SETUP"),
     }
 
+    # 2. If Python rules FAILED — return immediately, skip AI call (saves tokens + latency)
+    if not hard_rules_result["passed"]:
+        return {
+            "hard_rules_passed": False,
+            "failed_rules": hard_rules_result["failed_rules"],
+            "sanity_check_passed": False,
+            "sanity_concerns": [],
+            "risk_assessment": "REJECTED",
+            "rejection_reason": "; ".join(hard_rules_result["failed_rules"]),
+            "approved_lot_size": trade_proposal["lot_size"],
+            "approved_risk_usd": trade_proposal["risk_usd"],
+            "approved_entry": trade_proposal["entry_price"],
+            "approved_sl": trade_proposal["stop_loss"],
+            "approved_tp1": trade_proposal["take_profit_1"],
+            "approved_tp2": trade_proposal["take_profit_2"],
+            "risk_notes": "Hard rules failed — AI sanity check skipped.",
+            "agent": "RISK_MANAGER",
+            "vote": "RED",
+        }
+
+    # 3. Python rules PASSED — run AI sanity check
     system = (
         _SYSTEM_TEMPLATE
         .replace("{trade_proposal}", json.dumps(trade_proposal, indent=2))
@@ -245,16 +292,14 @@ async def run_risk_manager(
             indent=2,
         ))
     )
-
-    system = system + f"\n\nMEMORY CONTEXT: {memory_context}"
+    system += f"\n\nMEMORY CONTEXT: {memory_context}"
 
     user_message = (
-        f"Python hard rules {'PASSED' if hard_rules_result['passed'] else 'FAILED'}.\n"
-        f"Failed rules: {hard_rules_result['failed_rules']}\n"
+        f"Python hard rules PASSED.\n"
         f"Green votes: {green_count}/5 (before your vote)\n"
         f"Session: {session}\n"
         f"Balance: ${account_state.get('balance', 20)}\n\n"
-        f"{'Confirm APPROVED with full sanity check.' if hard_rules_result['passed'] else 'Confirm REJECTED.'}"
+        f"Perform final sanity check and confirm APPROVED or REJECTED."
     )
 
     try:
@@ -264,32 +309,27 @@ async def run_risk_manager(
             user_message=user_message,
             temperature=0.0,
         )
-        # Always honour Python hard rules — override AI if it contradicts
-        if not hard_rules_result["passed"]:
-            result["hard_rules_passed"] = False
-            result["failed_rules"] = hard_rules_result["failed_rules"]
-            result["risk_assessment"] = "REJECTED"
-            result["rejection_reason"] = "; ".join(hard_rules_result["failed_rules"])
-            result["vote"] = "RED"
+        # Always honour Python hard rules — override AI if contradicts
+        result["hard_rules_passed"] = True
+        result["failed_rules"] = []
         result.setdefault("agent", "RISK_MANAGER")
         return result
     except Exception as e:
-        print(f"[RiskManager] Error: {e}")
-        # Fall back to Python rules only
+        print(f"[RiskManager] AI sanity check error: {e}")
         return {
-            "hard_rules_passed": hard_rules_result["passed"],
-            "failed_rules": hard_rules_result["failed_rules"],
-            "sanity_check_passed": hard_rules_result["passed"],
-            "sanity_concerns": [f"AI sanity check failed: {str(e)[:100]}"],
-            "risk_assessment": "APPROVED" if hard_rules_result["passed"] else "REJECTED",
-            "rejection_reason": "; ".join(hard_rules_result["failed_rules"]) if not hard_rules_result["passed"] else None,
+            "hard_rules_passed": True,
+            "failed_rules": [],
+            "sanity_check_passed": True,
+            "sanity_concerns": [f"AI sanity check unavailable: {str(e)[:100]}"],
+            "risk_assessment": "APPROVED",
+            "rejection_reason": None,
             "approved_lot_size": trade_proposal["lot_size"],
             "approved_risk_usd": trade_proposal["risk_usd"],
             "approved_entry": trade_proposal["entry_price"],
             "approved_sl": trade_proposal["stop_loss"],
             "approved_tp1": trade_proposal["take_profit_1"],
             "approved_tp2": trade_proposal["take_profit_2"],
-            "risk_notes": f"AI sanity check unavailable: {str(e)[:200]}",
+            "risk_notes": f"AI sanity check failed — approved by Python rules only: {str(e)[:200]}",
             "agent": "RISK_MANAGER",
-            "vote": "GREEN" if hard_rules_result["passed"] else "RED",
+            "vote": "GREEN",
         }

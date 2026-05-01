@@ -1,12 +1,14 @@
 """
 Agent 2 — Technical Analyst
-Model: anthropic/claude-opus-4-6  |  Temp: 0.1
+Model: config.MODELS["technical_analyst"]  |  Temp: 0.1
 """
 
 import json
+
+from config import MODELS
 from utils.openrouter import call_openrouter
 
-MODEL = "anthropic/claude-opus-4-6"
+MODEL = MODELS["technical_analyst"]
 
 _SYSTEM_TEMPLATE = """You are a professional XAUUSD technical analyst specializing in
 Smart Money Concepts (SMC) and institutional price action.
@@ -19,33 +21,31 @@ ANALYSIS FRAMEWORK:
 
 1. MARKET STRUCTURE (H4 and H1)
    - Identify: Higher Highs/Higher Lows (bullish) or Lower Highs/Lower Lows (bearish)
-   - Current trend per timeframe
+   - Use the swing_highs and swing_lows arrays provided — they are pre-computed.
 
-2. ASIAN SESSION RANGE (00:00-07:00 GMT)
-   - Mark the HIGH and LOW precisely
-   - This is the compression zone London will break
-   - Direction of break = intraday trade direction
+2. ASIAN SESSION RANGE (23:00-07:00 GMT)
+   - The asian_range.high and asian_range.low are pre-computed from the 23:00-07:00 UTC window.
+   - This is the compression zone London will break.
+   - Direction of break = intraday trade direction.
 
 3. SMART MONEY CONCEPTS
    - Order Blocks: Last bearish candle before bullish move (support)
    - Fair Value Gaps: Imbalances to be filled
-   - Liquidity Pools: Highs/lows that will be swept before real move
+   - Liquidity Pools: Swing highs/lows that will be swept before real move
    - Breaker Blocks: Failed order blocks that flip
 
-4. EMA ALIGNMENT (H1)
-   - EMA9 > EMA21 > EMA50 = Strong bullish trend
-   - EMA9 < EMA21 < EMA50 = Strong bearish trend
+4. EMA ALIGNMENT (H1) — pre-computed flags provided:
+   - ema_aligned_bullish = EMA9 > EMA21 > EMA50
+   - ema_aligned_bearish = EMA9 < EMA21 < EMA50
 
-5. RSI 14 (H1)
+5. RSI 14 (H1, Wilder's smoothing — matches MT5):
+   - rsi_above_50 = RSI > 50
    - Above 50 + rising = bullish momentum
-   - Below 50 + falling = bearish momentum
-   - Divergence = potential reversal
 
-6. ATR 14 (H1)
-   - Used for stop loss sizing only
+6. ATR 14 (H1, Wilder's smoothing):
    - SL = beyond swing high/low + (ATR × 0.5)
 
-7. SETUP GRADING
+7. SETUP GRADING:
    A-Grade: 6/6 confluence, clear structure, obvious entry
    B-Grade: 4-5/6 confluence, good structure, clear entry
    C-Grade: 3/6 confluence — WAIT for better setup
@@ -103,22 +103,26 @@ Vote RED = NO_SETUP or confluence below 3"""
 
 async def run_technical_analyst(market_data: dict, memory_context: str) -> dict:
     """Run Technical Analyst — returns SMC chart analysis JSON."""
-    import json as _json
-    market_data_str = _json.dumps(market_data, indent=2)
+    market_data_str = json.dumps(market_data, indent=2)
 
-    system = _SYSTEM_TEMPLATE.replace("{market_data}", market_data_str).replace(
-        "{memory_context}", memory_context
+    system = (
+        _SYSTEM_TEMPLATE
+        .replace("{market_data}", market_data_str)
+        .replace("{memory_context}", memory_context)
     )
 
     user_message = (
         f"Analyze the XAUUSD chart data provided in your system prompt.\n"
         f"Current price: ${market_data['current_price']}\n"
+        f"Data source: {market_data.get('data_source', 'N/A')}\n"
         f"Asian Range: ${market_data['asian_range']['low']} — ${market_data['asian_range']['high']} "
         f"({market_data['asian_range']['size_pips']} pips)\n"
         f"EMA Bullish Stack: {market_data['ema_aligned_bullish']}\n"
         f"EMA Bearish Stack: {market_data['ema_aligned_bearish']}\n"
         f"RSI above 50: {market_data['rsi_above_50']}\n"
-        f"MACD Bullish: {market_data['macd_bullish']}\n\n"
+        f"MACD Bullish: {market_data['macd_bullish']}\n"
+        f"Swing Highs (recent): {market_data.get('swing_highs', [])}\n"
+        f"Swing Lows  (recent): {market_data.get('swing_lows', [])}\n\n"
         f"Grade this setup and provide full technical analysis with entry, SL, TP1, TP2."
     )
 
@@ -152,12 +156,8 @@ async def run_technical_analyst(market_data: dict, memory_context: str) -> dict:
             "rr_ratio_tp2": 0.0,
             "confluence_score": 0,
             "confluence_details": {
-                "h4_aligned": False,
-                "h1_aligned": False,
-                "ema_aligned": False,
-                "rsi_aligned": False,
-                "macd_aligned": False,
-                "key_level": False,
+                "h4_aligned": False, "h1_aligned": False, "ema_aligned": False,
+                "rsi_aligned": False, "macd_aligned": False, "key_level": False,
             },
             "key_levels": [],
             "order_blocks": [],

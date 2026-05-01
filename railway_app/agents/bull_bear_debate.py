@@ -1,14 +1,15 @@
 """
 Agent 4 — Bull vs Bear Debate
-Model: google/gemini-2.5-pro  |  Temp: 0.2
-Makes THREE separate API calls: Bull advocate → Bear advocate → Adjudicator.
+Model: config.MODELS["bull_bear_debate"]  |  Temp: 0.2
+Three sequential calls: Bull advocate → Bear advocate → Adjudicator.
 """
 
-import asyncio
 import json
+
+from config import MODELS
 from utils.openrouter import call_openrouter, call_openrouter_text
 
-MODEL = "google/gemini-2.5-pro"
+MODEL = MODELS["bull_bear_debate"]
 
 _BULL_SYSTEM = """You are the BULL ADVOCATE for this XAUUSD trade.
 Build the strongest possible case FOR taking this trade.
@@ -37,7 +38,8 @@ BULL ARGUMENTS: {bull_arguments}
 BEAR ARGUMENTS: {bear_arguments}
 MEMORY: {memory_context}
 
-Respond ONLY in valid JSON:
+Respond ONLY with a JSON object. Begin your response with {{ and end with }}.
+No prose, no markdown fences.
 {{
   "bull_score": 0,
   "bear_score": 0,
@@ -72,6 +74,7 @@ async def run_bull_bear_debate(
                 "asian_range": market_data["asian_range"],
                 "indicators": market_data["indicators"],
                 "h4_trend": market_data["h4_trend"],
+                "macro": market_data.get("macro", {}),
             },
             "macro_scout": macro,
             "technical_analyst": technical,
@@ -81,7 +84,7 @@ async def run_bull_bear_debate(
     )
 
     user_for_advocates = (
-        f"Here is all the data for the potential XAUUSD trade:\n\n{all_data_str}\n\n"
+        f"Here is all the data for the potential XAUUSD trade:\n\n{all_data_str[:3000]}\n\n"
         f"Build your case based on this evidence."
     )
 
@@ -122,7 +125,8 @@ async def run_bull_bear_debate(
 
     adj_user = (
         f"Score the Bull and Bear arguments above.\n"
-        f"Bull score, Bear score, winner, margin, conviction, key risk, verdict, vote."
+        f"Return ONLY a JSON object with bull_score, bear_score, winner, margin, "
+        f"conviction, key_risk_identified, debate_verdict, agent, vote."
     )
 
     try:

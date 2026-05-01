@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+from config import HARD_RULES
+
 
 def get_current_session() -> str:
     """Return the current trading session name based on UTC clock."""
@@ -18,10 +20,16 @@ def get_current_session() -> str:
 
 
 def is_valid_trading_time() -> bool:
-    """Return True only during London or NY open windows on weekdays."""
+    """Return True only during London or NY open windows on weekdays,
+    with a Friday 14:00 UTC hard cutoff to avoid weekend gap risk."""
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:  # Saturday=5, Sunday=6
         return False
+    # Friday 14:00 UTC cutoff — no new trades heading into weekend
+    if now.weekday() == 4:  # Friday
+        hm = now.hour * 60 + now.minute
+        if hm >= HARD_RULES["no_trade_friday_after_hm"]:
+            return False
     return get_current_session() in ("LONDON", "NEW_YORK")
 
 

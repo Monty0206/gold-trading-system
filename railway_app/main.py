@@ -1,39 +1,57 @@
 """
 GOLD SESSION SNIPER v2.0 — Railway Orchestrator
 Runs on cron schedule. Fires all agents. Logs to Supabase. Sends Telegram alert. Exits cleanly.
+
+Execution order (Fix #2):
+  1. macro + technical run in PARALLEL
+  2. quant runs SEQUENTIALLY with macro+technical outputs
+  3. debate runs with all three
+  4. risk manager
+  5. final executor
 """
 
 import asyncio
-import json
 import os
 import sys
 
-# Add railway_app/ to path so all module imports resolve correctly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
 from supabase import create_client
 
 load_dotenv()
 
-from agents.macro_scout import run_macro_scout
-from agents.technical_analyst import run_technical_analyst
-from agents.quant_reasoner import run_quant_reasoner
 from agents.bull_bear_debate import run_bull_bear_debate
-from agents.risk_manager import run_risk_manager
 from agents.final_executor import run_final_executor
+from agents.macro_scout import run_macro_scout
+from agents.quant_reasoner import run_quant_reasoner
+from agents.risk_manager import run_risk_manager
+from agents.technical_analyst import run_technical_analyst
 from memory.supabase_memory import (
     get_agent_memory,
+    get_balance_from_supabase,
     get_system_memory,
-    log_signal,
     log_agent_votes,
+    log_signal,
 )
 from utils.market_data import fetch_market_data
 from utils.openrouter import get_credits_info
-from utils.telegram_alerts import send_signal_alert, send_cost_alert, send_error_alert
 from utils.session_guard import get_current_session, is_valid_trading_time
+from utils.telegram_alerts import send_cost_alert, send_error_alert, send_signal_alert
+
+# ── Env var validation — fail fast with clear message ────────────────────────
+_REQUIRED_ENV = [
+    "OPENROUTER_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+]
+_missing = [v for v in _REQUIRED_ENV if not os.getenv(v)]
+if _missing:
+    raise RuntimeError(f"Missing required environment variables: {_missing}")
 
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
@@ -55,34 +73,55 @@ async def run_gold_sniper() -> None:
         sys.exit(0)
     print(f"Session: {session}")
 
-    # 1b. DAILY LOSS CIRCUIT BREAKER — abort BEFORE any agent runs if hit
+    # 2. READ ACCOUNT BALANCE FROM SUPABASE (Fix #7)
+    env_balance = float(os.getenv("ACCOUNT_BALANCE", "20.00"))
+    account_balance = await asyncio.to_thread(
+        lambda: asyncio.run(get_balance_from_supabase(supabase, fallback=env_balance))
+    )
+    # Simpler sync call since get_balance_from_supabase uses sync supabase client
     try:
-        from datetime import date as _date
-        account_balance = float(os.getenv("ACCOUNT_BALANCE", "20.00"))
-        daily_stop_pct = 3.0  # matches HARD_RULES["max_daily_loss_pct"]
-        today_iso = _date.today().isoformat()
+        bal_row = (
+            supabase.table("trade_outcomes")
+            .select("account_balance_after")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if bal_row.data and bal_row.data[0].get("account_balance_after"):
+            account_balance = float(bal_row.data[0]["account_balance_after"])
+            print(f"Balance (from Supabase): ${account_balance:.2f}")
+        else:
+            account_balance = env_balance
+            print(f"Balance (from env var):  ${account_balance:.2f}")
+    except Exception as e:
+        account_balance = env_balance
+        print(f"Balance read failed ({e}) — using env var: ${account_balance:.2f}")
+
+    # 3. DAILY LOSS CIRCUIT BREAKER — abort before any agent runs
+    try:
+        daily_stop_pct = 3.0
+        today_iso = date.today().isoformat()
         loss_rows = (
             supabase.table("trade_outcomes")
             .select("profit_usd")
             .gte("created_at", f"{today_iso}T00:00:00")
             .execute()
         )
-        daily_loss_usd = sum(
-            abs(float(r.get("profit_usd") or 0))
-            for r in (loss_rows.data or [])
-            if float(r.get("profit_usd") or 0) < 0
+        net_today = sum(
+            float(r.get("profit_usd") or 0) for r in (loss_rows.data or [])
         )
+        daily_loss_usd = abs(net_today) if net_today < 0 else 0.0
         daily_loss_pct = (daily_loss_usd / account_balance * 100) if account_balance > 0 else 0
         if daily_loss_pct >= daily_stop_pct:
             msg = (
-                f"DAILY STOP HIT — loss ${daily_loss_usd:.2f} "
-                f"({daily_loss_pct:.2f}%) >= {daily_stop_pct}%. Aborting session."
+                f"DAILY STOP HIT — net loss ${daily_loss_usd:.2f} "
+                f"({daily_loss_pct:.2f}%) >= {daily_stop_pct}%. Aborting."
             )
             print(msg)
             await send_error_alert(
-                f"🛑 DAILY STOP HIT\nLoss today: ${daily_loss_usd:.2f} "
+                f"DAILY STOP HIT\nNet loss today: ${daily_loss_usd:.2f} "
                 f"({daily_loss_pct:.2f}% of ${account_balance:.2f})\n"
-                f"Aborting {session} session — no trades will be generated."
+                f"Aborting {session} session."
             )
             sys.exit(0)
     except SystemExit:
@@ -90,7 +129,7 @@ async def run_gold_sniper() -> None:
     except Exception as e:
         print(f"WARNING: Daily-loss check failed (continuing): {e}")
 
-    # 2. SNAPSHOT OPENROUTER USAGE (before any agent calls)
+    # 4. SNAPSHOT OPENROUTER USAGE
     print("Snapshotting OpenRouter usage...")
     credits_before = await get_credits_info()
     if credits_before["error"]:
@@ -98,81 +137,86 @@ async def run_gold_sniper() -> None:
     else:
         print(f"   Usage so far: ${credits_before['usage_total']:.4f}")
 
-    # 3. FETCH LIVE MARKET DATA
+    # 5. FETCH LIVE MARKET DATA (MT5 via Supabase → yfinance fallback)
     print("Fetching XAUUSD market data...")
     try:
-        market_data = await fetch_market_data()
+        market_data = await fetch_market_data(supabase=supabase)
+        print(f"   Source: {market_data.get('data_source','?')}")
         print(f"   Price: ${market_data['current_price']}")
         print(f"   ATR:   {market_data['indicators']['atr_14']}")
-        print(
-            f"   Asian: {market_data['asian_range']['high']} / "
-            f"{market_data['asian_range']['low']}"
-        )
+        print(f"   Asian: {market_data['asian_range']['high']} / {market_data['asian_range']['low']}")
+        print(f"   DXY:   {market_data['macro']['dxy'].get('current','?')} ({market_data['macro']['dxy'].get('direction','?')})")
+        print(f"   10Y:   {market_data['macro']['tnx_10y'].get('current','?')}% ({market_data['macro']['tnx_10y'].get('direction','?')})")
+        print(f"   VIX:   {market_data['macro']['vix'].get('current','?')} ({market_data['macro']['vix'].get('direction','?')})")
+        cal_count = len(market_data.get("economic_calendar", []))
+        print(f"   Calendar: {cal_count} events today")
     except Exception as e:
         err = f"Market data failed: {e}"
         print(f"ERROR: {err}")
         await send_error_alert(err)
         sys.exit(1)
 
-    # 4. FETCH AGENT MEMORIES FROM SUPABASE
+    # 6. FETCH AGENT MEMORIES
     print("Loading agent memories from Supabase...")
     memories = {}
-    for agent in [
-        "MACRO_SCOUT",
-        "TECHNICAL_ANALYST",
-        "QUANT_REASONER",
-        "BULL_BEAR_DEBATE",
-        "RISK_MANAGER",
-    ]:
+    for agent in ["MACRO_SCOUT", "TECHNICAL_ANALYST", "QUANT_REASONER", "BULL_BEAR_DEBATE", "RISK_MANAGER"]:
         memories[agent] = await get_agent_memory(agent, supabase)
     system_memory = await get_system_memory(supabase)
 
-    # 5. RUN AGENTS 1, 2, 3 IN PARALLEL
-    print("Running parallel analysis agents...")
+    # 7. RUN AGENTS 1 + 2 IN PARALLEL (Fix #2)
+    print("Running macro + technical agents in parallel...")
     try:
-        macro, technical, quant = await asyncio.gather(
+        macro, technical = await asyncio.gather(
             run_macro_scout(market_data, memories["MACRO_SCOUT"]),
             run_technical_analyst(market_data, memories["TECHNICAL_ANALYST"]),
-            run_quant_reasoner(market_data, memories["QUANT_REASONER"]),
         )
-        print(f"   Macro:     {macro.get('vote')} — {macro.get('bias')}")
-        print(
-            f"   Technical: {technical.get('vote')} — "
-            f"Grade {technical.get('setup_grade')}"
-        )
-        print(
-            f"   Quant:     {quant.get('vote')} — "
-            f"Probability {quant.get('probability_score')}%"
-        )
+        print(f"   Macro:     {macro.get('vote')} — {macro.get('bias')} "
+              f"(DXY {macro.get('dxy_direction','?')}, Yields {macro.get('yields_direction','?')})")
+        print(f"   Technical: {technical.get('vote')} — Grade {technical.get('setup_grade')}")
     except Exception as e:
-        err = f"Agent 1-3 failed: {e}"
+        err = f"Agents 1-2 failed: {e}"
         print(f"ERROR: {err}")
         await send_error_alert(err)
         sys.exit(1)
 
-    # 6. BULL vs BEAR DEBATE
+    # 8. RUN QUANT SEQUENTIALLY with real macro+technical outputs (Fix #2)
+    print("Running quant reasoner (sequential — has macro+technical context)...")
+    try:
+        quant = await run_quant_reasoner(
+            market_data,
+            memories["QUANT_REASONER"],
+            macro_output=macro,
+            technical_output=technical,
+            account_balance=account_balance,
+        )
+        print(f"   Quant:     {quant.get('vote')} — "
+              f"Probability {quant.get('probability_score')}% | "
+              f"Lot {quant.get('correct_lot_size')} | R:R {quant.get('verified_rr_tp1')}")
+    except Exception as e:
+        err = f"Quant agent failed: {e}"
+        print(f"ERROR: {err}")
+        await send_error_alert(err)
+        sys.exit(1)
+
+    # 9. BULL vs BEAR DEBATE (has all three prior outputs)
     print("Running Bull vs Bear debate...")
     try:
         debate = await run_bull_bear_debate(
             market_data, macro, technical, quant, memories["BULL_BEAR_DEBATE"]
         )
-        print(
-            f"   Debate:    {debate.get('vote')} — "
-            f"{debate.get('winner')} wins ({debate.get('conviction')})"
-        )
+        print(f"   Debate:    {debate.get('vote')} — "
+              f"{debate.get('winner')} wins ({debate.get('conviction')})")
     except Exception as e:
         print(f"WARNING: Debate agent failed: {e}")
         debate = {
-            "vote": "RED",
-            "winner": "DRAW",
-            "conviction": "LOW",
+            "vote": "RED", "winner": "DRAW", "conviction": "LOW",
             "agent": "BULL_BEAR_DEBATE",
         }
 
-    # 7. RISK MANAGER
+    # 10. RISK MANAGER
     print("Risk Manager evaluating...")
     account_state = {
-        "balance": float(os.getenv("ACCOUNT_BALANCE", "20.00")),
+        "balance": account_balance,
         "session": session,
         "risk_pct": float(os.getenv("RISK_PCT", "1.0")),
         "max_lot": float(os.getenv("MAX_LOT", "0.01")),
@@ -181,50 +225,46 @@ async def run_gold_sniper() -> None:
     green_count = sum(1 for v in all_votes if v.get("vote") == "GREEN")
 
     risk = await run_risk_manager(
-        market_data,
-        all_votes,
-        green_count,
-        account_state,
-        memories["RISK_MANAGER"],
-        supabase=supabase,
+        market_data, all_votes, green_count, account_state,
+        memories["RISK_MANAGER"], supabase=supabase,
     )
     print(f"   Risk:      {risk.get('vote')} — {risk.get('risk_assessment')}")
     if risk.get("rejection_reason"):
         print(f"   Reason:    {risk.get('rejection_reason')}")
 
-    # 8. FINAL EXECUTOR
+    # 11. FINAL EXECUTOR
     print("Final Executor synthesizing...")
     all_outputs = {
-        "macro_scout": macro,
+        "macro_scout":      macro,
         "technical_analyst": technical,
-        "quant_reasoner": quant,
+        "quant_reasoner":   quant,
         "bull_bear_debate": debate,
-        "risk_manager": risk,
+        "risk_manager":     risk,
     }
     final = await run_final_executor(all_outputs, system_memory, account_state)
 
-    # 9. LOG TO SUPABASE
+    # 12. LOG TO SUPABASE
     print("Logging to Supabase...")
     total_green = green_count + (1 if risk.get("vote") == "GREEN" else 0)
     signal_data = {
-        "session": session,
-        "decision": final.get("decision"),
-        "direction": final.get("direction"),
-        "entry_price": final.get("entry_price"),
-        "stop_loss": final.get("stop_loss"),
-        "take_profit_1": final.get("take_profit_1"),
-        "take_profit_2": final.get("take_profit_2"),
-        "lot_size": final.get("lot_size"),
-        "risk_usd": final.get("risk_usd"),
-        "rr_ratio": final.get("rr_tp1"),
-        "confidence_score": final.get("confidence_score"),
-        "green_votes": total_green,
-        "agent_votes": all_outputs,
-        "macro_bias": macro.get("bias"),
-        "technical_grade": technical.get("setup_grade"),
-        "asian_range_high": market_data["asian_range"]["high"],
-        "asian_range_low": market_data["asian_range"]["low"],
-        "executed": False,
+        "session":           session,
+        "decision":          final.get("decision"),
+        "direction":         final.get("direction"),
+        "entry_price":       final.get("entry_price"),
+        "stop_loss":         final.get("stop_loss"),
+        "take_profit_1":     final.get("take_profit_1"),
+        "take_profit_2":     final.get("take_profit_2"),
+        "lot_size":          final.get("lot_size"),
+        "risk_usd":          final.get("risk_usd"),
+        "rr_ratio":          final.get("rr_tp1"),
+        "confidence_score":  final.get("confidence_score"),
+        "green_votes":       total_green,
+        "agent_votes":       all_outputs,
+        "macro_bias":        macro.get("bias"),
+        "technical_grade":   technical.get("setup_grade"),
+        "asian_range_high":  market_data["asian_range"]["high"],
+        "asian_range_low":   market_data["asian_range"]["low"],
+        "executed":          False,
     }
     try:
         signal_id = await log_signal(signal_data, supabase)
@@ -234,22 +274,17 @@ async def run_gold_sniper() -> None:
         signal_id = "logging-failed"
         print(f"WARNING: Supabase logging failed: {e}")
 
-    # 10. SEND TELEGRAM SIGNAL ALERT
-    print("Sending Telegram signal alert...")
+    # 13. SEND TELEGRAM ALERTS
+    print("Sending Telegram alerts...")
     await send_signal_alert(final, signal_id, total_green, session)
 
-    # 11. SEND TELEGRAM COST SUMMARY
-    print("Calculating session cost...")
     credits_after = await get_credits_info()
-
     session_cost = 0.0
     if not credits_before["error"] and not credits_after["error"]:
         session_cost = max(0.0, credits_after["usage_total"] - credits_before["usage_total"])
 
-    # Count how many signals ran today (to approximate total daily spend)
     today_session_count = 1
     try:
-        from datetime import date
         today_iso = date.today().isoformat()
         today_rows = (
             supabase.table("trade_signals")
@@ -259,21 +294,14 @@ async def run_gold_sniper() -> None:
         )
         today_session_count = max(1, today_rows.count or 1)
     except Exception:
-        pass  # Fall back to 1 session
+        pass
 
     total_today = session_cost * today_session_count
-
-    # Days remaining: credits_remaining / projected daily cost (2 sessions/day)
     days_remaining = None
     if credits_after["credits_remaining"] is not None and session_cost > 0:
-        daily_rate = session_cost * 2
-        days_remaining = credits_after["credits_remaining"] / daily_rate
+        days_remaining = credits_after["credits_remaining"] / (session_cost * 2)
 
-    print(
-        f"   Session cost: ${session_cost:.4f} | "
-        f"Credits remaining: "
-        + (f"${credits_after['credits_remaining']:.4f}" if credits_after["credits_remaining"] is not None else "N/A")
-    )
+    print(f"   Session cost: ${session_cost:.4f}")
     await send_cost_alert(
         session_cost=session_cost,
         total_today=total_today,
@@ -283,26 +311,20 @@ async def run_gold_sniper() -> None:
         today_session_count=today_session_count,
     )
 
-    # 13. TERMINAL SUMMARY
+    # 14. TERMINAL SUMMARY
     elapsed = (datetime.now(timezone.utc) - start_time).seconds
     print(f"\n{'='*60}")
     print(f"FINAL DECISION")
     print(f"{'='*60}")
     print(f"Decision:    {final.get('decision')}")
     print(f"Direction:   {final.get('direction')}")
-    print(f"Entry:       ${final.get('entry_price', 'N/A')}")
-    print(f"Stop Loss:   ${final.get('stop_loss', 'N/A')}")
-    print(
-        f"TP1:         ${final.get('take_profit_1', 'N/A')} "
-        f"(R:R {final.get('rr_tp1', 'N/A')})"
-    )
-    print(
-        f"TP2:         ${final.get('take_profit_2', 'N/A')} "
-        f"(R:R {final.get('rr_tp2', 'N/A')})"
-    )
-    print(f"Lot Size:    {final.get('lot_size', 'N/A')}")
-    print(f"Risk:        ${final.get('risk_usd', 'N/A')}")
-    print(f"Confidence:  {final.get('confidence_score', 'N/A')}%")
+    print(f"Entry:       ${final.get('entry_price','N/A')}")
+    print(f"Stop Loss:   ${final.get('stop_loss','N/A')}")
+    print(f"TP1:         ${final.get('take_profit_1','N/A')} (R:R {final.get('rr_tp1','N/A')})")
+    print(f"TP2:         ${final.get('take_profit_2','N/A')} (R:R {final.get('rr_tp2','N/A')})")
+    print(f"Lot Size:    {final.get('lot_size','N/A')}")
+    print(f"Risk:        ${final.get('risk_usd','N/A')}")
+    print(f"Confidence:  {final.get('confidence_score','N/A')}%")
     print(f"Green Votes: {total_green}/6")
     print(f"Signal ID:   {signal_id}")
     print(f"Runtime:     {elapsed}s")
@@ -312,4 +334,23 @@ async def run_gold_sniper() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_gold_sniper())
+    try:
+        # Global 4-minute budget — London breakout setups expire quickly
+        asyncio.run(asyncio.wait_for(run_gold_sniper(), timeout=240))
+    except asyncio.TimeoutError:
+        print("ERROR: Session run exceeded 4-minute budget")
+        try:
+            asyncio.run(send_error_alert("Session timed out after 4 minutes — no signal generated"))
+        except Exception:
+            pass
+        sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        try:
+            asyncio.run(send_error_alert(f"FATAL ERROR: {e}"))
+        except Exception:
+            pass
+        sys.exit(1)
