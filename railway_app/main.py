@@ -75,10 +75,6 @@ async def run_gold_sniper() -> None:
 
     # 2. READ ACCOUNT BALANCE FROM SUPABASE (Fix #7)
     env_balance = float(os.getenv("ACCOUNT_BALANCE", "20.00"))
-    account_balance = await asyncio.to_thread(
-        lambda: asyncio.run(get_balance_from_supabase(supabase, fallback=env_balance))
-    )
-    # Simpler sync call since get_balance_from_supabase uses sync supabase client
     try:
         bal_row = (
             supabase.table("trade_outcomes")
@@ -163,9 +159,40 @@ async def run_gold_sniper() -> None:
         memories[agent] = await get_agent_memory(agent, supabase)
     system_memory = await get_system_memory(supabase)
 
-    # 7. RUN AGENTS 1 + 2 IN PARALLEL (Fix #2)
-    print("Running macro + technical agents in parallel...")
-    try:
+    # ── Pre-initialise all agent outputs with RED/ABORT safe defaults.
+    # These are used by the logging section even if the agent phase times out.
+    account_state = {
+        "balance":  account_balance,
+        "session":  session,
+        "risk_pct": float(os.getenv("RISK_PCT", "1.0")),
+        "max_lot":  float(os.getenv("MAX_LOT", "0.01")),
+    }
+    macro     = {"vote": "RED",  "agent": "MACRO_SCOUT",       "bias": "UNKNOWN"}
+    technical = {"vote": "RED",  "agent": "TECHNICAL_ANALYST",  "setup_grade": "NO_SETUP"}
+    quant     = {"vote": "RED",  "agent": "QUANT_REASONER",    "probability_score": 0,
+                 "correct_lot_size": 0.01, "max_risk_usd": 0.20, "verified_rr_tp1": 0}
+    debate    = {"vote": "RED",  "agent": "BULL_BEAR_DEBATE",  "winner": "BEAR", "conviction": "LOW"}
+    risk      = {"vote": "RED",  "agent": "RISK_MANAGER",
+                 "risk_assessment": "REJECTED", "rejection_reason": "Agent phase incomplete"}
+    all_outputs: dict = {}
+    green_count = 0
+    total_green = 0
+    final: dict = {
+        "decision": "ABORT", "direction": "NONE",
+        "entry_price": 0, "stop_loss": 0, "take_profit_1": 0, "take_profit_2": 0,
+        "lot_size": 0, "risk_usd": 0, "rr_tp1": 0, "rr_tp2": 0,
+        "confidence_score": 0,
+        "abort_reason": "Agent phase did not complete",
+        "agent": "FINAL_EXECUTOR",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # ── 7-11. AGENT PHASE — 150s budget so logging always has ≥90s of the 240s total
+    async def _run_agents() -> None:
+        nonlocal macro, technical, quant, debate, risk, all_outputs, final, green_count, total_green
+
+        # 7. Macro + Technical in parallel
+        print("Running macro + technical agents in parallel...")
         macro, technical = await asyncio.gather(
             run_macro_scout(market_data, memories["MACRO_SCOUT"]),
             run_technical_analyst(market_data, memories["TECHNICAL_ANALYST"]),
@@ -173,15 +200,9 @@ async def run_gold_sniper() -> None:
         print(f"   Macro:     {macro.get('vote')} — {macro.get('bias')} "
               f"(DXY {macro.get('dxy_direction','?')}, Yields {macro.get('yields_direction','?')})")
         print(f"   Technical: {technical.get('vote')} — Grade {technical.get('setup_grade')}")
-    except Exception as e:
-        err = f"Agents 1-2 failed: {e}"
-        print(f"ERROR: {err}")
-        await send_error_alert(err)
-        sys.exit(1)
 
-    # 8. RUN QUANT SEQUENTIALLY with real macro+technical outputs (Fix #2)
-    print("Running quant reasoner (sequential — has macro+technical context)...")
-    try:
+        # 8. Quant sequentially (needs macro+technical outputs)
+        print("Running quant reasoner (sequential — has macro+technical context)...")
         quant = await run_quant_reasoner(
             market_data,
             memories["QUANT_REASONER"],
@@ -192,60 +213,75 @@ async def run_gold_sniper() -> None:
         print(f"   Quant:     {quant.get('vote')} — "
               f"Probability {quant.get('probability_score')}% | "
               f"Lot {quant.get('correct_lot_size')} | R:R {quant.get('verified_rr_tp1')}")
-    except Exception as e:
-        err = f"Quant agent failed: {e}"
-        print(f"ERROR: {err}")
-        await send_error_alert(err)
-        sys.exit(1)
 
-    # 9. BULL vs BEAR DEBATE (has all three prior outputs)
-    print("Running Bull vs Bear debate...")
-    try:
-        debate = await run_bull_bear_debate(
-            market_data, macro, technical, quant, memories["BULL_BEAR_DEBATE"]
-        )
+        # 9. Bull vs Bear debate
+        print("Running Bull vs Bear debate...")
+        try:
+            debate_result = await run_bull_bear_debate(
+                market_data, macro, technical, quant, memories["BULL_BEAR_DEBATE"]
+            )
+        except Exception as e:
+            print(f"WARNING: Debate agent failed: {e}")
+            debate_result = {"vote": "RED", "winner": "DRAW", "conviction": "LOW",
+                             "agent": "BULL_BEAR_DEBATE"}
+        debate.update(debate_result)
         print(f"   Debate:    {debate.get('vote')} — "
               f"{debate.get('winner')} wins ({debate.get('conviction')})")
+
+        # 10. Risk Manager
+        print("Risk Manager evaluating...")
+        all_votes = [macro, technical, quant, debate]
+        green_count = sum(1 for v in all_votes if v.get("vote") == "GREEN")
+
+        risk_result = await run_risk_manager(
+            market_data, all_votes, green_count, account_state,
+            memories["RISK_MANAGER"], supabase=supabase,
+        )
+        risk.update(risk_result)
+        print(f"   Risk:      {risk.get('vote')} — {risk.get('risk_assessment')}")
+        if risk.get("rejection_reason"):
+            print(f"   Reason:    {risk.get('rejection_reason')}")
+
+        # 11. Final Executor
+        print("Final Executor synthesizing...")
+        all_outputs.update({
+            "macro_scout":       macro,
+            "technical_analyst": technical,
+            "quant_reasoner":    quant,
+            "bull_bear_debate":  debate,
+            "risk_manager":      risk,
+        })
+        final_result = await run_final_executor(all_outputs, system_memory, account_state)
+        final.update(final_result)
+        total_green = green_count + (1 if risk.get("vote") == "GREEN" else 0)
+
+    try:
+        await asyncio.wait_for(_run_agents(), timeout=150)
+    except asyncio.TimeoutError:
+        print("ERROR: Agent phase timed out (>150s) — logging ABORT signal")
+        await send_error_alert("Agent pipeline timed out after 150s — ABORT logged, no trade placed")
+        total_green = green_count + (1 if risk.get("vote") == "GREEN" else 0)
+        final["abort_reason"] = "Agent pipeline timed out (>150s)"
+    except SystemExit:
+        raise
     except Exception as e:
-        print(f"WARNING: Debate agent failed: {e}")
-        debate = {
-            "vote": "RED", "winner": "DRAW", "conviction": "LOW",
-            "agent": "BULL_BEAR_DEBATE",
-        }
+        err = f"Agent phase error: {e}"
+        print(f"ERROR: {err}")
+        await send_error_alert(err)
+        total_green = 0
+        final["abort_reason"] = str(e)[:300]
 
-    # 10. RISK MANAGER
-    print("Risk Manager evaluating...")
-    account_state = {
-        "balance": account_balance,
-        "session": session,
-        "risk_pct": float(os.getenv("RISK_PCT", "1.0")),
-        "max_lot": float(os.getenv("MAX_LOT", "0.01")),
-    }
-    all_votes = [macro, technical, quant, debate]
-    green_count = sum(1 for v in all_votes if v.get("vote") == "GREEN")
-
-    risk = await run_risk_manager(
-        market_data, all_votes, green_count, account_state,
-        memories["RISK_MANAGER"], supabase=supabase,
-    )
-    print(f"   Risk:      {risk.get('vote')} — {risk.get('risk_assessment')}")
-    if risk.get("rejection_reason"):
-        print(f"   Reason:    {risk.get('rejection_reason')}")
-
-    # 11. FINAL EXECUTOR
-    print("Final Executor synthesizing...")
-    all_outputs = {
-        "macro_scout":      macro,
-        "technical_analyst": technical,
-        "quant_reasoner":   quant,
-        "bull_bear_debate": debate,
-        "risk_manager":     risk,
-    }
-    final = await run_final_executor(all_outputs, system_memory, account_state)
-
-    # 12. LOG TO SUPABASE
+    # ── 12. LOG TO SUPABASE (always runs — even on agent timeout) ─────────────
     print("Logging to Supabase...")
     total_green = green_count + (1 if risk.get("vote") == "GREEN" else 0)
+    if not all_outputs:
+        all_outputs = {
+            "macro_scout":       macro,
+            "technical_analyst": technical,
+            "quant_reasoner":    quant,
+            "bull_bear_debate":  debate,
+            "risk_manager":      risk,
+        }
     signal_data = {
         "session":           session,
         "decision":          final.get("decision"),
@@ -274,7 +310,7 @@ async def run_gold_sniper() -> None:
         signal_id = "logging-failed"
         print(f"WARNING: Supabase logging failed: {e}")
 
-    # 13. SEND TELEGRAM ALERTS
+    # ── 13. SEND TELEGRAM ALERTS ──────────────────────────────────────────────
     print("Sending Telegram alerts...")
     await send_signal_alert(final, signal_id, total_green, session)
 
@@ -311,7 +347,7 @@ async def run_gold_sniper() -> None:
         today_session_count=today_session_count,
     )
 
-    # 14. TERMINAL SUMMARY
+    # ── 14. TERMINAL SUMMARY ──────────────────────────────────────────────────
     elapsed = (datetime.now(timezone.utc) - start_time).seconds
     print(f"\n{'='*60}")
     print(f"FINAL DECISION")
@@ -325,7 +361,7 @@ async def run_gold_sniper() -> None:
     print(f"Lot Size:    {final.get('lot_size','N/A')}")
     print(f"Risk:        ${final.get('risk_usd','N/A')}")
     print(f"Confidence:  {final.get('confidence_score','N/A')}%")
-    print(f"Green Votes: {total_green}/6")
+    print(f"Green Votes: {total_green}/5")
     print(f"Signal ID:   {signal_id}")
     print(f"Runtime:     {elapsed}s")
     print(f"{'='*60}\n")

@@ -80,26 +80,35 @@ def _python_calculations(
     risk_pct: float,
 ) -> dict:
     """Deterministic Python lot/RR calculations. These are the ground truth."""
-    entry = float(
-        technical.get("entry_zone_from")
-        or technical.get("entry_zone_to")
-        or 0
-    )
+    # Use midpoint of entry zone — avoids using wrong end for SHORT vs LONG
+    zone_from = float(technical.get("entry_zone_from") or 0)
+    zone_to   = float(technical.get("entry_zone_to") or 0)
+    if zone_from > 0 and zone_to > 0:
+        entry = round((zone_from + zone_to) / 2, 2)
+    else:
+        entry = zone_from or zone_to
+
     sl  = float(technical.get("stop_loss", 0) or 0)
     tp1 = float(technical.get("take_profit_1", 0) or 0)
     tp2 = float(technical.get("take_profit_2", 0) or 0)
 
-    risk_amount = account_balance * (risk_pct / 100)
+    target_risk_usd = round(account_balance * (risk_pct / 100), 2)
 
-    # XAUUSD: 1 pip = $0.10 per 0.01 lot on a standard account
-    # pip_risk = |entry - SL| * 10 (convert price diff to pips)
-    # lot = risk_amount / (pip_risk * 10.0)  [10.0 = pip value per 0.01 lot * 100]
-    pip_risk = abs(entry - sl) * 10 if sl and entry else 0
-    if pip_risk > 0:
-        raw_lot = risk_amount / (pip_risk * 10.0)
-        lot_size = min(0.01, round(raw_lot, 2))  # cap at 0.01 for <$50 account
+    # XAUUSD canonical lot sizing:
+    #   contract_size = 100 oz
+    #   P&L per lot   = price_distance_dollars * 100
+    #   lot_size      = risk_usd / (price_distance_dollars * 100)
+    # On a $20 account with a $2 stop: raw_lot = 0.20 / (2.00 * 100) = 0.001
+    # Deriv minimum lot is 0.01 — the cap always applies at this account size.
+    # risk_usd stays as TARGET (not actual) so the risk-manager gate is consistent.
+    max_lot = float(os.getenv("MAX_LOT", "0.01"))
+    min_lot = 0.01
+    price_distance = abs(entry - sl) if sl and entry else 0
+    if price_distance > 0:
+        raw_lot  = target_risk_usd / (price_distance * 100)
+        lot_size = max(min_lot, min(max_lot, round(raw_lot, 3)))
     else:
-        lot_size = 0.01
+        lot_size = min_lot
 
     rr_tp1 = (
         round(abs(tp1 - entry) / abs(entry - sl), 2)
@@ -113,10 +122,10 @@ def _python_calculations(
     )
 
     return {
-        "lot_size": lot_size,
-        "risk_usd": round(risk_amount, 2),
-        "rr_tp1": rr_tp1,
-        "rr_tp2": rr_tp2,
+        "lot_size":   lot_size,
+        "risk_usd":   target_risk_usd,  # target risk for risk-manager gate
+        "rr_tp1":     rr_tp1,
+        "rr_tp2":     rr_tp2,
     }
 
 

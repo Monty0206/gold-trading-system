@@ -85,6 +85,9 @@ async def call_openrouter(
                 if response.status_code in _RETRY_STATUSES:
                     wait = 2 ** attempt
                     print(f"[OpenRouter] HTTP {response.status_code} — retry {attempt+1}/3 in {wait}s")
+                    last_exc = httpx.HTTPStatusError(
+                        f"HTTP {response.status_code}", request=response.request, response=response
+                    )
                     await asyncio.sleep(wait)
                     continue
                 response.raise_for_status()
@@ -133,6 +136,9 @@ async def call_openrouter_text(
                 if response.status_code in _RETRY_STATUSES:
                     wait = 2 ** attempt
                     print(f"[OpenRouter] HTTP {response.status_code} — retry {attempt+1}/3 in {wait}s")
+                    last_exc = httpx.HTTPStatusError(
+                        f"HTTP {response.status_code}", request=response.request, response=response
+                    )
                     await asyncio.sleep(wait)
                     continue
                 response.raise_for_status()

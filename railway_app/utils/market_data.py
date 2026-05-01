@@ -285,7 +285,7 @@ def _fetch_sync(supabase=None) -> dict:
         # Staleness check: last candle must be within 6 hours
         last_ts = df_1h.index[-1]
         age_h = (pd.Timestamp(now) - last_ts).total_seconds() / 3600
-        if age_h > 6:
+        if age_h > 1:
             raise ValueError(
                 f"yfinance data stale — last candle {last_ts} is {age_h:.1f}h old. "
                 "Market may be closed or yfinance feed delayed."
@@ -337,24 +337,29 @@ def _fetch_sync(supabase=None) -> dict:
         asian_high = float(asian_slice["High"].max())
         asian_low  = float(asian_slice["Low"].min())
     else:
-        # 8-hour fallback (covers pre-London period when Asian data is thin)
-        fallback_start = pd.Timestamp(now) - pd.Timedelta(hours=8)
+        # Fallback: full 00:00-07:00 UTC window today (fixed anchor, not rolling).
+        # Using a rolling "last 8h" window at NY-open time (12:45 UTC) would include
+        # London-session prices, producing a false breakout level for NY analysis.
+        fallback_start = today_ts               # 00:00 UTC today
+        fallback_end   = today_ts + pd.Timedelta(hours=7)  # 07:00 UTC today
         fb = (
-            df_15m[df_15m.index >= fallback_start]
+            df_15m[(df_15m.index >= fallback_start) & (df_15m.index < fallback_end)]
             if not df_15m.empty and df_15m.index.tz is not None
             else pd.DataFrame()
         )
         if not fb.empty:
-            print("[MarketData] Using 8h fallback for Asian range (expected window empty)")
+            print("[MarketData] Using 00:00-07:00 UTC fallback for Asian range")
             asian_high = float(fb["High"].max())
             asian_low  = float(fb["Low"].min())
         else:
             raise ValueError(
-                "Cannot determine Asian range — no 15m candle data available. "
+                "Cannot determine Asian range — no 15m candle data in 00:00-07:00 UTC window. "
                 "Aborting session to prevent trades on fabricated levels."
             )
 
     # ── 6. Day range ──────────────────────────────────────────────────────────
+    if not df.empty and df.index.tz is None:
+        print("[MarketData] WARNING: H1 dataframe has tz-naive index — day range will use full dataset")
     day_slice = (
         df[df.index >= today_ts]
         if not df.empty and df.index.tz is not None

@@ -198,8 +198,10 @@ def place_trade(signal: dict) -> dict:
     else:
         return {"success": False, "error": f"Unknown direction: {direction}"}
 
-    # Tighter slippage guard (15 pips — was 50, $0.50 was unacceptable on $20)
-    slippage_pips = abs(price - signal_entry) * 10
+    # Slippage vs mid-price (not execution side) so natural spread doesn't consume the allowance.
+    # signal_entry is a mid/bid price from Railway; compare to mid to isolate true market drift.
+    mid_price     = (tick.bid + tick.ask) / 2
+    slippage_pips = abs(mid_price - signal_entry) * 10
     if slippage_pips > 15:
         return {
             "success": False,
@@ -260,7 +262,12 @@ def place_trade(signal: dict) -> dict:
 
 def check_trade_outcome(ticket: int, signal_id: str, signal: dict):
     """Return outcome dict if trade has closed, else None."""
-    if mt5.positions_get(ticket=ticket):
+    pos_result = mt5.positions_get(ticket=ticket)
+    if pos_result is None:
+        # API error (e.g. disconnected) — do not mark as closed
+        print(f"[Monitor] positions_get({ticket}) returned None — skipping check")
+        return None
+    if len(pos_result) > 0:
         return None  # Still open
 
     # Only look back 7 days — avoids pulling years of history every 5s
@@ -478,13 +485,42 @@ def main():
     # Load daily loss from Supabase (survives restarts)
     daily_loss_usd      = get_daily_loss_from_supabase()
     last_balance_check  = time.time()
-    daily_stop          = float(mt5.account_info().balance) * 0.03
+    acct_info           = mt5.account_info()
+    session_start_balance = float(acct_info.balance) if acct_info else 20.0
+    daily_stop          = session_start_balance * 0.03  # H7: anchored to session-start balance
     daily_stop_alerted  = False
     last_loss_reset     = datetime.now(timezone.utc).date()
 
-    open_trades: dict          = {}  # {signal_id: {"ticket": int, "signal": dict}}
-    be_moved_trades: set       = set()
-    session_closed_today: set  = set()
+    # H4: Re-hydrate open positions from a previous run (PC reboot / executor restart).
+    # Filters by magic number so we never touch manually placed or other-EA positions.
+    open_trades: dict         = {}  # {signal_id: {"ticket": int, "signal": dict}}
+    be_moved_trades: set      = set()
+    session_closed_today: set = set()
+
+    live_positions = mt5.positions_get(symbol=SYMBOL) or []
+    for pos in live_positions:
+        if pos.magic != 20260101:
+            continue
+        try:
+            sig_row = (
+                supabase.table("trade_signals")
+                .select("*")
+                .eq("mt5_ticket", pos.ticket)
+                .execute()
+            )
+            if sig_row.data:
+                sig = sig_row.data[0]
+                open_trades[sig["id"]] = {"ticket": pos.ticket, "signal": sig}
+                # Detect if SL was already moved to BE for this position
+                direction = sig.get("direction", "")
+                if direction == "LONG" and pos.sl >= pos.price_open - 0.01:
+                    be_moved_trades.add(pos.ticket)
+                elif direction == "SHORT" and pos.sl <= pos.price_open + 0.01:
+                    be_moved_trades.add(pos.ticket)
+                print(f"[Startup] Re-loaded open trade: {sig['id'][:8]} | "
+                      f"Ticket #{pos.ticket} | BE={'yes' if pos.ticket in be_moved_trades else 'no'}")
+        except Exception as e:
+            print(f"[Startup] Could not re-load trade for ticket #{pos.ticket}: {e}")
 
     print(f"Watching Supabase for signals...\n"
           f"Daily loss loaded from Supabase: ${daily_loss_usd:.2f}\n"
@@ -500,18 +536,18 @@ def main():
                 daily_loss_usd     = get_daily_loss_from_supabase()
                 daily_stop_alerted = False
                 last_loss_reset    = today
-                # Update daily_stop from live MT5 balance
+                # Anchor daily_stop to the START-of-day balance (H7 fix).
+                # Using live balance would shrink the stop after losses and expand it after wins,
+                # making it a moving target. Snapshot once at midnight for the full day.
                 acct = mt5.account_info()
                 if acct:
-                    daily_stop = float(acct.balance) * 0.03
+                    session_start_balance = float(acct.balance)
+                    daily_stop = session_start_balance * 0.03
 
             # Refresh daily_loss from Supabase every 60s (in case other process updated it)
             if time.time() - last_balance_check > 60:
                 daily_loss_usd     = get_daily_loss_from_supabase()
                 last_balance_check = time.time()
-                acct = mt5.account_info()
-                if acct:
-                    daily_stop = float(acct.balance) * 0.03
 
             # Friday 14:00 UTC — refuse new signals heading into weekend
             is_friday_cutoff = (
@@ -521,7 +557,44 @@ def main():
 
             stale_cutoff = now_utc - timedelta(minutes=30)
 
-            # ── 1. CHECK FOR NEW EXECUTE SIGNALS ────────────────────────────
+            # ── 1. PRE-LOOP GUARDS (run once per poll, before signal processing) ──
+
+            # C3: Equity stop hoisted above signal loop — runs once per cycle,
+            # not once per signal, to avoid closing already-closed positions repeatedly.
+            equity_stop_active = False
+            acct = mt5.account_info()
+            if acct and acct.equity < acct.balance * 0.95:
+                msg = (
+                    f"EQUITY STOP: equity ${acct.equity:.2f} < "
+                    f"95% of balance ${acct.balance:.2f}"
+                )
+                print(msg)
+                send_telegram(f"EQUITY STOP TRIGGERED\n{msg}\nClosing all positions.")
+                for pos in [p for p in (mt5.positions_get(symbol=SYMBOL) or [])
+                             if p.magic == 20260101]:
+                    close_position(pos)
+                equity_stop_active = True
+
+            # M5: Release signals stuck in PENDING_EXECUTION for >2 min (e.g. executor crashed
+            # between claim and place_trade). Prevents signals from being permanently blocked.
+            try:
+                pending_cutoff = (now_utc - timedelta(minutes=2)).isoformat()
+                stuck = (
+                    supabase.table("trade_signals")
+                    .select("id")
+                    .eq("execution_error", "PENDING_EXECUTION")
+                    .lt("created_at", pending_cutoff)
+                    .execute()
+                )
+                for s in (stuck.data or []):
+                    print(f"[Cleanup] Releasing stuck PENDING signal {s['id'][:8]}")
+                    supabase.table("trade_signals").update(
+                        {"execution_error": "Execution crashed — auto-released after 2min"}
+                    ).eq("id", s["id"]).execute()
+            except Exception as e:
+                print(f"[Cleanup] Stale PENDING cleanup error: {e}")
+
+            # ── 2. CHECK FOR NEW EXECUTE SIGNALS ────────────────────────────
             try:
                 new_signals = (
                     supabase.table("trade_signals")
@@ -578,19 +651,10 @@ def main():
                     ).eq("id", signal_id).execute()
                     continue
 
-                # EQUITY STOP — close all + refuse if floating loss > 5%
-                acct = mt5.account_info()
-                if acct and acct.equity < acct.balance * 0.95:
-                    msg = (
-                        f"EQUITY STOP: equity ${acct.equity:.2f} < "
-                        f"95% of balance ${acct.balance:.2f}"
-                    )
-                    print(msg)
-                    send_telegram(f"EQUITY STOP TRIGGERED\n{msg}\nClosing all positions.")
-                    for pos in (mt5.positions_get(symbol=SYMBOL) or []):
-                        close_position(pos)
+                # Equity stop (C3: flag signal, don't re-close positions)
+                if equity_stop_active:
                     supabase.table("trade_signals").update(
-                        {"execution_error": msg}
+                        {"execution_error": "Equity stop active — no new trades"}
                     ).eq("id", signal_id).execute()
                     continue
 
@@ -667,7 +731,9 @@ def main():
             ]:
                 key = f"{session_name}|{today.isoformat()}"
                 if trigger_min <= current_hm < end_min and key not in session_closed_today:
-                    positions = mt5.positions_get(symbol=SYMBOL) or []
+                    # H8: filter by magic so manual/other-EA XAUUSD positions are never touched
+                    positions = [p for p in (mt5.positions_get(symbol=SYMBOL) or [])
+                                 if p.magic == 20260101]
                     if positions:
                         print(f"\nSession {session_name} ending — closing {len(positions)} positions.")
                         send_session_close_alert(session_name)

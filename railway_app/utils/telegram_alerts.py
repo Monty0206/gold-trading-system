@@ -24,7 +24,7 @@ async def send_signal_alert(
             f"*Decision:* {action} XAUUSD ✅\n"
             f"*Session:* {session}\n"
             f"*Confidence:* {final.get('confidence_score')}%\n"
-            f"*Agents:* {green_votes}/6 GREEN\n\n"
+            f"*Agents:* {green_votes}/5 GREEN\n\n"
             f"📊 *TRADE LEVELS*\n"
             f"Entry:    `${final.get('entry_price')}`\n"
             f"Stop:     `${final.get('stop_loss')}`\n"
@@ -43,7 +43,7 @@ async def send_signal_alert(
             f"*Decision:* WAIT — No trade\n"
             f"*Session:* {session}\n"
             f"*Reason:* {final.get('wait_reason', 'Setup not ready')}\n"
-            f"*Green Votes:* {green_votes}/6\n\n"
+            f"*Green Votes:* {green_votes}/5\n\n"
             f"Next analysis at next session."
         )
 

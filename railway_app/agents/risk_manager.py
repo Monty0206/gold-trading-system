@@ -52,7 +52,8 @@ Respond ONLY in valid JSON:
 Only GREEN if APPROVED. RED if any concern. No exceptions."""
 
 
-def _count_open_trades_today(supabase) -> int:
+def _count_executed_trades_today(supabase) -> int:
+    """Count trades executed today (enforces max trades per day, not simultaneous positions)."""
     if supabase is None:
         return 0
     try:
@@ -140,6 +141,11 @@ def _check_python_hard_rules(
     if technical_output.get("setup_grade") == "NO_SETUP":
         failed.append("Technical grade is NO_SETUP")
 
+    # Unclear breakout direction — never trade UNCLEAR setups
+    breakout_dir = technical_output.get("expected_breakout_direction", "UNCLEAR")
+    if breakout_dir not in ("UP", "DOWN"):
+        failed.append(f"Breakout direction is {breakout_dir!r} — must be UP or DOWN")
+
     # Min probability
     probability = quant_output.get("probability_score", 0)
     if probability < HARD_RULES["min_probability"]:
@@ -147,9 +153,11 @@ def _check_python_hard_rules(
             f"Probability {probability}% < minimum {HARD_RULES['min_probability']}%"
         )
 
-    # Min R:R
+    # Min R:R — also reject rr==0 (parse failure / no data)
     rr = quant_output.get("verified_rr_tp1", 0.0)
-    if 0 < rr < HARD_RULES["min_rr_ratio"]:
+    if rr <= 0:
+        failed.append(f"R:R is {rr} — no valid R:R data")
+    elif rr < HARD_RULES["min_rr_ratio"]:
         failed.append(f"R:R {rr:.2f} < minimum {HARD_RULES['min_rr_ratio']}")
 
     # Max lot size
@@ -166,8 +174,8 @@ def _check_python_hard_rules(
             f"Risk {proposed_risk_pct:.2f}% > max {HARD_RULES['max_risk_pct']}%"
         )
 
-    # Max open trades today
-    open_today = _count_open_trades_today(supabase)
+    # Max trades executed today
+    open_today = _count_executed_trades_today(supabase)
     if open_today >= HARD_RULES["max_open_trades"]:
         failed.append(
             f"Already {open_today} executed trades today — max {HARD_RULES['max_open_trades']}"
@@ -244,13 +252,23 @@ async def run_risk_manager(
         supabase=supabase,
     )
 
-    entry = (
-        technical_output.get("entry_zone_from")
-        or technical_output.get("entry_zone_to")
-        or 0
-    )
+    zone_from = float(technical_output.get("entry_zone_from") or 0)
+    zone_to   = float(technical_output.get("entry_zone_to") or 0)
+    if zone_from > 0 and zone_to > 0:
+        entry = round((zone_from + zone_to) / 2, 2)
+    else:
+        entry = zone_from or zone_to
+
+    _breakout_dir = technical_output.get("expected_breakout_direction", "UNCLEAR")
+    if _breakout_dir == "UP":
+        _direction = "LONG"
+    elif _breakout_dir == "DOWN":
+        _direction = "SHORT"
+    else:
+        _direction = "NONE"
+
     trade_proposal = {
-        "direction": "LONG" if technical_output.get("expected_breakout_direction") == "UP" else "SHORT",
+        "direction": _direction,
         "entry_price": entry,
         "stop_loss": technical_output.get("stop_loss", 0),
         "take_profit_1": technical_output.get("take_profit_1", 0),
