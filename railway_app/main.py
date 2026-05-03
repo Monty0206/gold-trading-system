@@ -29,6 +29,9 @@ from agents.macro_scout import run_macro_scout
 from agents.quant_reasoner import run_quant_reasoner
 from agents.risk_manager import run_risk_manager
 from agents.technical_analyst import run_technical_analyst
+from agents import news_sentiment as news_agent
+from agents import volatility_regime as regime_agent
+from agents import correlation_agent as corr_agent
 from memory.supabase_memory import (
     get_agent_memory,
     get_balance_from_supabase,
@@ -187,9 +190,61 @@ async def run_gold_sniper() -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── 7-11. AGENT PHASE — 150s budget so logging always has ≥90s of the 240s total
+    # ── 7-11. AGENT PHASE — 240s budget (was 150s); logging still has time within global budget
+    regime_result: dict = {}
+    news_result: dict = {}
+    corr_result: dict = {}
+
     async def _run_agents() -> None:
         nonlocal macro, technical, quant, debate, risk, all_outputs, final, green_count, total_green
+        nonlocal regime_result, news_result, corr_result
+
+        # 7a. Pre-checks — Volatility regime + News sentiment (run first, in parallel)
+        print("Running pre-checks (volatility regime + news sentiment)...")
+        candles_m15 = market_data.get("candles_m15") or market_data.get("recent_candles_1h", [])
+        atr_pips_in = None
+        try:
+            atr_val = market_data.get("indicators", {}).get("atr_14")
+            if atr_val is not None:
+                # ATR is in price units (XAUUSD: 1 pip = 0.10), convert to pips
+                atr_pips_in = float(atr_val) * 10
+        except Exception:
+            atr_pips_in = None
+
+        try:
+            regime_result = regime_agent.run(
+                candles_m15=candles_m15,
+                current_atr=atr_pips_in,
+            )
+        except Exception as exc:
+            print(f"   Regime agent error: {exc}")
+            regime_result = {"agent": "volatility_regime", "vote": "GREEN",
+                             "regime": "NORMAL", "min_confluence": 4,
+                             "lot_multiplier": 1.0, "sl_multiplier": 1.0,
+                             "atr_pips": 15.0, "note": "Default (error)"}
+
+        try:
+            news_result = await news_agent.run(
+                current_price=market_data.get("current_price", 0.0),
+                session=session,
+            )
+        except Exception as exc:
+            print(f"   News agent error: {exc}")
+            news_result = {"agent": "news_sentiment", "vote": "YELLOW",
+                           "sentiment_label": "NEUTRAL", "trade_caution": False,
+                           "caution_reason": None}
+
+        print(f"   Regime: {regime_result.get('regime')} (ATR {regime_result.get('atr_pips')} pips, "
+              f"min_conf={regime_result.get('min_confluence')}, lot_mult={regime_result.get('lot_multiplier')})")
+        print(f"   News:   {news_result.get('sentiment_label')} caution={news_result.get('trade_caution')}")
+
+        # Skip if breaking news warrants caution AND vote is RED
+        if news_result.get("trade_caution") and news_result.get("vote") == "RED":
+            print("WARNING: News agent flagged trade_caution=True with RED vote — aborting trade")
+            final["decision"] = "ABORT"
+            final["abort_reason"] = (
+                f"News blackout: {news_result.get('caution_reason') or news_result.get('key_headline') or 'breaking news'}"
+            )
 
         # 7. Macro + Technical in parallel
         print("Running macro + technical agents in parallel...")
@@ -201,18 +256,54 @@ async def run_gold_sniper() -> None:
               f"(DXY {macro.get('dxy_direction','?')}, Yields {macro.get('yields_direction','?')})")
         print(f"   Technical: {technical.get('vote')} — Grade {technical.get('setup_grade')}")
 
-        # 8. Quant sequentially (needs macro+technical outputs)
-        print("Running quant reasoner (sequential — has macro+technical context)...")
+        # CHANGE 8 — verify confluence score arithmetic
+        if isinstance(technical, dict) and "confluence_details" in technical and "confluence_score" in technical:
+            details = technical.get("confluence_details") or {}
+            if isinstance(details, dict):
+                actual_score = sum(1 for v in details.values() if v)
+                try:
+                    reported = int(technical.get("confluence_score", 0) or 0)
+                except (TypeError, ValueError):
+                    reported = 0
+                if abs(actual_score - reported) > 1:
+                    print(f"   WARNING: Confluence mismatch reported={reported} actual={actual_score}. Using actual.")
+                    technical["confluence_score"] = actual_score
+
+        # 7b. Correlation agent — run AFTER macro_scout (needs macro_bias)
+        try:
+            corr_result = corr_agent.run(
+                macro_data=market_data.get("macro", {}),
+                macro_bias=macro.get("bias", "NEUTRAL"),
+            )
+        except Exception as exc:
+            print(f"   Correlation agent error: {exc}")
+            corr_result = {"agent": "correlation", "vote": "YELLOW",
+                           "aligned_count": 0, "total_signals": 0,
+                           "confidence_modifier": 0.0, "note": "Error"}
+        print(f"   Corr:      {corr_result.get('vote')} — "
+              f"{corr_result.get('aligned_count')}/{corr_result.get('total_signals')} aligned "
+              f"(modifier {corr_result.get('confidence_modifier')})")
+
+        # 8. Quant sequentially (needs macro+technical+regime outputs)
+        print("Running quant reasoner (sequential — has macro+technical+regime context)...")
         quant = await run_quant_reasoner(
             market_data,
             memories["QUANT_REASONER"],
             macro_output=macro,
             technical_output=technical,
             account_balance=account_balance,
+            regime_result=regime_result,
         )
         print(f"   Quant:     {quant.get('vote')} — "
               f"Probability {quant.get('probability_score')}% | "
               f"Lot {quant.get('correct_lot_size')} | R:R {quant.get('verified_rr_tp1')}")
+
+        # CHANGE 8 — abort if quant rejected the trade (lot_size==0)
+        if quant.get("correct_lot_size") in (0, 0.0) and quant.get("abort"):
+            print(f"   ABORT: Quant rejected — {quant.get('calculation_notes', 'unknown reason')}")
+            final["abort_reason"] = (
+                f"Quant rejected: {quant.get('calculation_notes', 'lot too small')}"
+            )
 
         # 9. Bull vs Bear debate
         print("Running Bull vs Bear debate...")
@@ -228,7 +319,7 @@ async def run_gold_sniper() -> None:
         print(f"   Debate:    {debate.get('vote')} — "
               f"{debate.get('winner')} wins ({debate.get('conviction')})")
 
-        # 10. Risk Manager
+        # 10. Risk Manager (with dynamic regime confluence min)
         print("Risk Manager evaluating...")
         all_votes = [macro, technical, quant, debate]
         green_count = sum(1 for v in all_votes if v.get("vote") == "GREEN")
@@ -236,13 +327,14 @@ async def run_gold_sniper() -> None:
         risk_result = await run_risk_manager(
             market_data, all_votes, green_count, account_state,
             memories["RISK_MANAGER"], supabase=supabase,
+            min_confluence_override=regime_result.get("min_confluence"),
         )
         risk.update(risk_result)
         print(f"   Risk:      {risk.get('vote')} — {risk.get('risk_assessment')}")
         if risk.get("rejection_reason"):
             print(f"   Reason:    {risk.get('rejection_reason')}")
 
-        # 11. Final Executor
+        # 11. Final Executor — include regime/news/correlation in context
         print("Final Executor synthesizing...")
         all_outputs.update({
             "macro_scout":       macro,
@@ -250,18 +342,21 @@ async def run_gold_sniper() -> None:
             "quant_reasoner":    quant,
             "bull_bear_debate":  debate,
             "risk_manager":      risk,
+            "volatility_regime": regime_result,
+            "news_sentiment":    news_result,
+            "correlation":       corr_result,
         })
         final_result = await run_final_executor(all_outputs, system_memory, account_state)
         final.update(final_result)
         total_green = green_count + (1 if risk.get("vote") == "GREEN" else 0)
 
     try:
-        await asyncio.wait_for(_run_agents(), timeout=150)
+        await asyncio.wait_for(_run_agents(), timeout=240)
     except asyncio.TimeoutError:
-        print("ERROR: Agent phase timed out (>150s) — logging ABORT signal")
-        await send_error_alert("Agent pipeline timed out after 150s — ABORT logged, no trade placed")
+        print("ERROR: Agent phase timed out (>240s) — logging ABORT signal")
+        await send_error_alert("Agent pipeline timed out after 240s — ABORT logged, no trade placed")
         total_green = green_count + (1 if risk.get("vote") == "GREEN" else 0)
-        final["abort_reason"] = "Agent pipeline timed out (>150s)"
+        final["abort_reason"] = "Agent pipeline timed out (>240s)"
     except SystemExit:
         raise
     except Exception as e:
@@ -371,12 +466,12 @@ async def run_gold_sniper() -> None:
 
 if __name__ == "__main__":
     try:
-        # Global 4-minute budget — London breakout setups expire quickly
-        asyncio.run(asyncio.wait_for(run_gold_sniper(), timeout=240))
+        # Global 6-minute budget — agent phase is now 240s, leaves 120s for logging/alerts
+        asyncio.run(asyncio.wait_for(run_gold_sniper(), timeout=360))
     except asyncio.TimeoutError:
-        print("ERROR: Session run exceeded 4-minute budget")
+        print("ERROR: Session run exceeded 6-minute budget")
         try:
-            asyncio.run(send_error_alert("Session timed out after 4 minutes — no signal generated"))
+            asyncio.run(send_error_alert("Session timed out after 6 minutes — no signal generated"))
         except Exception:
             pass
         sys.exit(1)

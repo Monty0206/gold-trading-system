@@ -145,9 +145,17 @@ def _compute_swing_points(df: pd.DataFrame, lookback: int = 5) -> tuple[list, li
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_macro_tickers() -> dict:
-    """Fetch DXY, US 10Y yields, and VIX from yfinance."""
+    """Fetch DXY, US 10Y yields, VIX, GVZ (gold vol), Crude Oil, BTC from yfinance."""
     result = {}
-    for key, sym in [("dxy", "DX-Y.NYB"), ("tnx_10y", "^TNX"), ("vix", "^VIX")]:
+    tickers = [
+        ("dxy",     "DX-Y.NYB"),
+        ("tnx_10y", "^TNX"),
+        ("vix",     "^VIX"),
+        ("gvz",     "^GVZ"),     # Gold Volatility Index
+        ("oil",     "CL=F"),      # Crude Oil (inflation hedge correlation)
+        ("btc",     "BTC-USD"),   # Bitcoin (risk-on/safe-haven proxy)
+    ]
+    for key, sym in tickers:
         try:
             df = _ensure_utc(yf.Ticker(sym).history(period="5d", interval="1h"))
             if not df.empty:
@@ -159,6 +167,7 @@ def _fetch_macro_tickers() -> dict:
                     "current": round(cur, 4),
                     "prev_close": round(prev, 4),
                     "change_pct": round(chg, 3),
+                    "change": round(chg, 3),  # alias used by correlation_agent
                     "direction": direction,
                 }
             else:
@@ -337,23 +346,23 @@ def _fetch_sync(supabase=None) -> dict:
         asian_high = float(asian_slice["High"].max())
         asian_low  = float(asian_slice["Low"].min())
     else:
-        # Fallback: full 00:00-07:00 UTC window today (fixed anchor, not rolling).
+        # Fallback uses the SAME window as primary: 23:00 UTC prev day → 07:00 UTC today.
         # Using a rolling "last 8h" window at NY-open time (12:45 UTC) would include
         # London-session prices, producing a false breakout level for NY analysis.
-        fallback_start = today_ts               # 00:00 UTC today
-        fallback_end   = today_ts + pd.Timedelta(hours=7)  # 07:00 UTC today
+        fallback_start = asian_start  # 23:00 UTC previous day (same as primary)
+        fallback_end   = asian_end    # 07:00 UTC today (same as primary)
         fb = (
             df_15m[(df_15m.index >= fallback_start) & (df_15m.index < fallback_end)]
             if not df_15m.empty and df_15m.index.tz is not None
             else pd.DataFrame()
         )
         if not fb.empty:
-            print("[MarketData] Using 00:00-07:00 UTC fallback for Asian range")
+            print("[MarketData] Using 23:00-07:00 UTC fallback for Asian range")
             asian_high = float(fb["High"].max())
             asian_low  = float(fb["Low"].min())
         else:
             raise ValueError(
-                "Cannot determine Asian range — no 15m candle data in 00:00-07:00 UTC window. "
+                "Cannot determine Asian range — no 15m candle data in 23:00-07:00 UTC window. "
                 "Aborting session to prevent trades on fabricated levels."
             )
 
@@ -423,6 +432,16 @@ def _fetch_sync(supabase=None) -> dict:
             "dxy":        macro_tickers.get("dxy",    {}),
             "tnx_10y":    macro_tickers.get("tnx_10y", {}),
             "vix":        macro_tickers.get("vix",    {}),
+            "gvz":        macro_tickers.get("gvz",    {}),
+            "oil":        macro_tickers.get("oil",    {}),
+            "btc":        macro_tickers.get("btc",    {}),
+            # Flat change_pct fields for correlation_agent
+            "dxy_change":      macro_tickers.get("dxy",     {}).get("change_pct", 0),
+            "yield_10y_change": macro_tickers.get("tnx_10y", {}).get("change_pct", 0),
+            "vix_change":      macro_tickers.get("vix",     {}).get("change_pct", 0),
+            "gvz_change":      macro_tickers.get("gvz",     {}).get("change_pct", 0),
+            "oil_change":      macro_tickers.get("oil",     {}).get("change_pct", 0),
+            "btc_change":      macro_tickers.get("btc",     {}).get("change_pct", 0),
         },
         "economic_calendar": calendar,
     }

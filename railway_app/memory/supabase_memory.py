@@ -157,8 +157,11 @@ async def update_outcome(signal_id: str, outcome_data: dict, supabase) -> None:
     """
     Called by home PC after a trade closes.
     Logs the outcome and marks each agent vote correct/incorrect using
-    vote-direction logic: GREEN+WIN=correct, GREEN+LOSS=wrong,
-    RED+LOSS=correct, RED+WIN=wrong, YELLOW=not scored (was_correct=NULL).
+    role-aware scoring (CHANGE 9):
+      - GREEN-voting agents: GREEN+WIN=correct, GREEN+LOSS=wrong, etc.
+      - Protective agents (risk_manager, bear): caution rewarded unless
+        they blocked a clean (>= 2R) winner.
+      - YELLOW votes are now scored.
     """
     try:
         supabase.table("trade_outcomes").insert(
@@ -166,35 +169,122 @@ async def update_outcome(signal_id: str, outcome_data: dict, supabase) -> None:
         ).execute()
 
         outcome = outcome_data.get("outcome")  # WIN / LOSS / BREAKEVEN
-        _mark_agent_correctness(signal_id, outcome, supabase)
+
+        # Compute rr_achieved if not supplied
+        rr_achieved = outcome_data.get("rr_achieved")
+        if rr_achieved is None:
+            try:
+                sig = (
+                    supabase.table("trade_signals")
+                    .select("entry_price, stop_loss")
+                    .eq("id", signal_id)
+                    .execute()
+                )
+                if sig.data:
+                    entry = float(sig.data[0].get("entry_price") or 0)
+                    sl    = float(sig.data[0].get("stop_loss") or 0)
+                    risk_distance = abs(entry - sl) if entry and sl else 0
+                    profit_pips = float(outcome_data.get("profit_pips") or 0)
+                    if risk_distance > 0:
+                        rr_achieved = (profit_pips / 10.0) / risk_distance
+            except Exception:
+                rr_achieved = None
+
+        _mark_agent_correctness(signal_id, outcome, supabase, rr_achieved=rr_achieved)
         await _update_pattern_memory(signal_id, outcome_data, supabase)
     except Exception as e:
         print(f"[Memory] Failed to update outcome: {e}")
 
 
-def _mark_agent_correctness(signal_id: str, outcome: str, supabase) -> None:
-    """Update was_correct for each agent vote based on vote direction."""
+_GREEN_VOTING_AGENTS    = {"MACRO_SCOUT", "TECHNICAL_ANALYST", "QUANT_REASONER", "FINAL_EXECUTOR"}
+_PROTECTIVE_AGENTS      = {"RISK_MANAGER", "BEAR_ADVOCATE"}
+
+
+def _mark_agent_correctness(signal_id: str, outcome: str, supabase,
+                              rr_achieved: float | None = None) -> None:
+    """Update was_correct for each agent vote.
+
+    Scoring logic (CHANGE 9):
+    - GREEN-voting agents (macro/technical/quant/final_executor):
+        was_correct = (vote == "GREEN" and trade_won)
+                       or (vote != "GREEN" and not trade_won)
+    - Protective agents (risk_manager, bear_advocate):
+        was_correct = True when vote was RED/YELLOW on any outcome
+                       (they're doing their job by being cautious).
+        was_correct = False only if voted RED and the trade was a clean win (>= 2R).
+    - YELLOW votes are now scored (a YELLOW on a winner counts as partial_correct).
+    """
     try:
         rows = (
             supabase.table("agent_performance")
-            .select("id, vote")
+            .select("id, vote, agent_name")
             .eq("signal_id", signal_id)
             .execute()
         )
+        trade_won = (outcome == "WIN")
+        clean_win = trade_won and (rr_achieved is not None and rr_achieved >= 2.0)
+
         for row in (rows.data or []):
-            vote = row.get("vote", "")
-            if vote == "YELLOW":
-                # Neutral vote — don't score, leave was_correct NULL
+            vote = (row.get("vote") or "").upper()
+            agent_name = (row.get("agent_name") or "").upper()
+
+            if outcome == "BREAKEVEN":
                 continue
-            if outcome == "WIN":
-                was_correct = (vote == "GREEN")   # GREEN on a winner = correct
-            elif outcome == "LOSS":
-                was_correct = (vote == "RED")     # RED on a loser = correct caution
+
+            was_correct: bool | None = None
+            partial_correct = False
+
+            if agent_name in _PROTECTIVE_AGENTS:
+                # Protective agents: cautious is good unless they blocked a clean win
+                if vote in ("RED", "YELLOW"):
+                    if vote == "RED" and clean_win:
+                        was_correct = False  # blocked a clean winner
+                    else:
+                        was_correct = True   # caution rewarded
+                elif vote == "GREEN":
+                    # If protective agent went GREEN, it's a regular GREEN scoring
+                    was_correct = trade_won
+            elif agent_name in _GREEN_VOTING_AGENTS:
+                if vote == "GREEN":
+                    was_correct = trade_won
+                elif vote == "RED":
+                    was_correct = not trade_won
+                elif vote == "YELLOW":
+                    # YELLOW now scored: a YELLOW on a winner is partial_correct
+                    if trade_won:
+                        was_correct = True
+                        partial_correct = True
+                    else:
+                        was_correct = True   # YELLOW on a loser = caution rewarded
             else:
-                continue  # BREAKEVEN — don't score
-            supabase.table("agent_performance").update(
-                {"was_correct": was_correct, "outcome": outcome}
-            ).eq("id", row["id"]).execute()
+                # Unknown agent — fall back to direction logic
+                if vote == "GREEN":
+                    was_correct = trade_won
+                elif vote == "RED":
+                    was_correct = not trade_won
+                elif vote == "YELLOW":
+                    was_correct = True if not trade_won else True
+                    partial_correct = trade_won
+
+            if was_correct is None:
+                continue
+
+            update = {"was_correct": was_correct, "outcome": outcome}
+            if partial_correct:
+                update["partial_correct"] = True
+            try:
+                supabase.table("agent_performance").update(update).eq(
+                    "id", row["id"]
+                ).execute()
+            except Exception as inner_e:
+                # If partial_correct column doesn't exist, retry without it
+                if "partial_correct" in str(inner_e) or "column" in str(inner_e).lower():
+                    update.pop("partial_correct", None)
+                    supabase.table("agent_performance").update(update).eq(
+                        "id", row["id"]
+                    ).execute()
+                else:
+                    raise
     except Exception as e:
         print(f"[Memory] Agent correctness update failed: {e}")
 

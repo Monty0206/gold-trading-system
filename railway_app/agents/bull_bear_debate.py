@@ -1,7 +1,7 @@
 """
 Agent 4 — Bull vs Bear Debate
-Model: config.MODELS["bull_bear_debate"]  |  Temp: 0.2
-Three sequential calls: Bull advocate → Bear advocate → Adjudicator.
+Heterogeneous models: GPT-4o (Bull) vs Claude-Sonnet-4.5 (Bear) vs Gemini-2.5-Pro (Adjudicator)
+Three sequential calls: Bull advocate -> Bear advocate -> Adjudicator.
 """
 
 import json
@@ -9,7 +9,9 @@ import json
 from config import MODELS
 from utils.openrouter import call_openrouter, call_openrouter_text
 
-MODEL = MODELS["bull_bear_debate"]
+BULL_MODEL  = MODELS["bull_advocate"]
+BEAR_MODEL  = MODELS["bear_advocate"]
+ADJ_MODEL   = MODELS["debate_adjudicator"]
 
 _BULL_SYSTEM = """You are the BULL ADVOCATE for this XAUUSD trade.
 Build the strongest possible case FOR taking this trade.
@@ -59,6 +61,44 @@ Vote YELLOW = DRAW or NARROW margin
 Vote RED = BEAR wins OR LOW conviction"""
 
 
+def _build_context_string(market_data: dict, macro: dict, technical: dict, quant: dict,
+                            char_budget: int = 3000) -> str:
+    """Serialize critical fields first, then fill remaining char budget with full context."""
+    # Pull from technical_output for entry/sl/tp/grade/bias/confluence
+    critical = {
+        "entry":          technical.get("entry_zone_from") or technical.get("entry_zone_to"),
+        "entry_zone":     [technical.get("entry_zone_from"), technical.get("entry_zone_to")],
+        "sl":             technical.get("stop_loss"),
+        "tp1":            technical.get("take_profit_1"),
+        "tp2":            technical.get("take_profit_2"),
+        "grade":          technical.get("setup_grade"),
+        "expected_breakout_direction": technical.get("expected_breakout_direction"),
+        "confluence_score": technical.get("confluence_score"),
+        "macro_bias":     macro.get("bias"),
+        "rr_tp1":         quant.get("verified_rr_tp1"),
+        "probability":    quant.get("probability_score"),
+        "regime":         quant.get("regime"),
+    }
+    critical_str = json.dumps(critical)
+    full_ctx = {
+        "market_data": {
+            "price":       market_data.get("current_price"),
+            "asian_range": market_data.get("asian_range"),
+            "indicators":  market_data.get("indicators"),
+            "h4_trend":    market_data.get("h4_trend"),
+            "macro":       market_data.get("macro", {}),
+        },
+        "macro_scout":       macro,
+        "technical_analyst": technical,
+        "quant_reasoner":    quant,
+    }
+    full_str = json.dumps(full_ctx)
+    remaining = char_budget - len(critical_str) - 50
+    if remaining < 0:
+        remaining = 0
+    return critical_str + "\n\nFULL_CONTEXT: " + full_str[:remaining]
+
+
 async def run_bull_bear_debate(
     market_data: dict,
     macro: dict,
@@ -66,35 +106,27 @@ async def run_bull_bear_debate(
     quant: dict,
     memory_context: str,
 ) -> dict:
-    """Run Bull vs Bear debate — three sequential API calls."""
-    all_data_str = json.dumps(
-        {
-            "market_data": {
-                "price": market_data["current_price"],
-                "asian_range": market_data["asian_range"],
-                "indicators": market_data["indicators"],
-                "h4_trend": market_data["h4_trend"],
-                "macro": market_data.get("macro", {}),
-            },
-            "macro_scout": macro,
-            "technical_analyst": technical,
-            "quant_reasoner": quant,
-        },
-        indent=2,
+    """Run Bull vs Bear debate with heterogeneous models."""
+    all_data_str = _build_context_string(
+        market_data=market_data,
+        macro=macro,
+        technical=technical,
+        quant=quant,
+        char_budget=3000,
     )
 
     user_for_advocates = (
-        f"Here is all the data for the potential XAUUSD trade:\n\n{all_data_str[:3000]}\n\n"
+        f"Here is all the data for the potential XAUUSD trade:\n\n{all_data_str}\n\n"
         f"Build your case based on this evidence."
     )
 
-    bull_system = _BULL_SYSTEM.replace("{all_prior_data}", all_data_str[:3000])
-    bear_system = _BEAR_SYSTEM.replace("{all_prior_data}", all_data_str[:3000])
+    bull_system = _BULL_SYSTEM.replace("{all_prior_data}", all_data_str)
+    bear_system = _BEAR_SYSTEM.replace("{all_prior_data}", all_data_str)
 
-    # Step 1 — Bull arguments
+    # Step 1 — Bull arguments (GPT-4o)
     try:
         bull_args = await call_openrouter_text(
-            model=MODEL,
+            model=BULL_MODEL,
             system_prompt=bull_system,
             user_message=user_for_advocates,
             temperature=0.2,
@@ -103,10 +135,10 @@ async def run_bull_bear_debate(
     except Exception as e:
         bull_args = f"Bull advocate failed: {e}"
 
-    # Step 2 — Bear arguments
+    # Step 2 — Bear arguments (Claude Sonnet 4.5)
     try:
         bear_args = await call_openrouter_text(
-            model=MODEL,
+            model=BEAR_MODEL,
             system_prompt=bear_system,
             user_message=user_for_advocates,
             temperature=0.2,
@@ -115,7 +147,7 @@ async def run_bull_bear_debate(
     except Exception as e:
         bear_args = f"Bear advocate failed: {e}"
 
-    # Step 3 — Adjudicator synthesises and votes
+    # Step 3 — Adjudicator (Gemini 2.5 Pro)
     adj_system = (
         _ADJUDICATOR_SYSTEM
         .replace("{bull_arguments}", bull_args[:1500])
@@ -131,7 +163,7 @@ async def run_bull_bear_debate(
 
     try:
         result = await call_openrouter(
-            model=MODEL,
+            model=ADJ_MODEL,
             system_prompt=adj_system,
             user_message=adj_user,
             temperature=0.2,

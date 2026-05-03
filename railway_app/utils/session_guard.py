@@ -34,12 +34,15 @@ def is_valid_trading_time() -> bool:
 
 
 def get_minutes_until_news(news_events: list) -> int:
-    """Return minutes until the next HIGH-impact event, or -1 if none found."""
+    """Return minutes until the next HIGH or MEDIUM-impact FUTURE event, or -1 if none.
+    Past events are filtered out (only events with timestamps after now are considered).
+    """
     now = datetime.now(timezone.utc)
     min_minutes = float("inf")
 
     for event in news_events:
-        if event.get("impact") != "HIGH":
+        # Tightened: blackout MEDIUM and HIGH impact (was HIGH only)
+        if event.get("impact") not in ("HIGH", "MEDIUM"):
             continue
         time_str = event.get("time_gmt", "")
         if not time_str:
@@ -51,7 +54,10 @@ def get_minutes_until_news(news_events: list) -> int:
                 today.year, today.month, today.day, h, m, tzinfo=timezone.utc
             )
             diff = (event_dt - now).total_seconds() / 60
-            if 0 < diff < min_minutes:
+            # Filter out past events — only future events count
+            if diff <= 0:
+                continue
+            if diff < min_minutes:
                 min_minutes = diff
         except (ValueError, TypeError, AttributeError):
             continue
@@ -60,6 +66,6 @@ def get_minutes_until_news(news_events: list) -> int:
 
 
 def is_in_news_blackout(news_events: list, blackout_minutes: int = 30) -> bool:
-    """Return True if a HIGH-impact news event is within blackout_minutes."""
+    """Return True if a HIGH or MEDIUM-impact future event is within blackout_minutes."""
     mins = get_minutes_until_news(news_events)
     return 0 <= mins <= blackout_minutes

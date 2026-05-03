@@ -23,7 +23,7 @@ ANALYSIS FRAMEWORK:
    - Identify: Higher Highs/Higher Lows (bullish) or Lower Highs/Lower Lows (bearish)
    - Use the swing_highs and swing_lows arrays provided — they are pre-computed.
 
-2. ASIAN SESSION RANGE (23:00-07:00 GMT)
+2. ASIAN SESSION RANGE (23:00 UTC previous day → 07:00 UTC today)
    - The asian_range.high and asian_range.low are pre-computed from the 23:00-07:00 UTC window.
    - This is the compression zone London will break.
    - Direction of break = intraday trade direction.
@@ -134,6 +134,23 @@ async def run_technical_analyst(market_data: dict, memory_context: str) -> dict:
             temperature=0.1,
         )
         result.setdefault("agent", "TECHNICAL_ANALYST")
+
+        # Verify LLM-reported confluence_score matches actual flags
+        if "confluence_details" in result and "confluence_score" in result:
+            details = result.get("confluence_details") or {}
+            if isinstance(details, dict):
+                actual_score = sum(1 for v in details.values() if v)
+                reported_score = result.get("confluence_score", 0)
+                try:
+                    reported_score = int(reported_score)
+                except (TypeError, ValueError):
+                    reported_score = 0
+                if abs(actual_score - reported_score) > 1:
+                    print(
+                        f"[TechnicalAnalyst] Confluence score mismatch: "
+                        f"reported={reported_score}, actual={actual_score}. Using actual."
+                    )
+                    result["confluence_score"] = actual_score
         return result
     except Exception as e:
         print(f"[TechnicalAnalyst] Error: {e}")

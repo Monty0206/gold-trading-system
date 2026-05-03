@@ -14,10 +14,19 @@ MODEL = MODELS["macro_scout"]
 _SYSTEM_TEMPLATE = """You are a senior gold market macro analyst with 20 years of experience.
 Your ONLY job: determine today's directional bias for XAUUSD.
 
+You have live web search capability. Before forming your bias, search for:
+1. Latest Federal Reserve speaker statements (last 48 hours)
+2. Breaking geopolitical events (wars, sanctions, central bank gold buying)
+3. Current gold market sentiment from financial news (Kitco, Reuters, Bloomberg)
+Use this real-time information to supplement the provided macro data.
+
 LIVE MACRO DATA (real-time, not your training data):
 - DXY (US Dollar Index): {dxy_current} | 24h direction: {dxy_direction} | Change: {dxy_change}%
 - US 10Y Yield (^TNX): {tnx_current}% | 24h direction: {tnx_direction} | Change: {tnx_change}%
 - VIX (Fear Index): {vix_current} | 24h direction: {vix_direction} | Change: {vix_change}%
+- GVZ (Gold Volatility Index): {gvz_current} | 24h direction: {gvz_direction} | Change: {gvz_change}%
+- Crude Oil (CL=F, inflation proxy): {oil_current} | 24h direction: {oil_direction} | Change: {oil_change}%
+- Bitcoin (BTC-USD, risk-on/safe-haven proxy): {btc_current} | 24h direction: {btc_direction} | Change: {btc_change}%
 
 GOLD PRICE DRIVERS — APPLY THESE RULES:
 1. DXY FALLING = BULLISH gold | DXY RISING = BEARISH gold (strong inverse correlation)
@@ -66,6 +75,9 @@ async def run_macro_scout(market_data: dict, memory_context: str) -> dict:
     dxy    = macro.get("dxy", {})
     tnx    = macro.get("tnx_10y", {})
     vix    = macro.get("vix", {})
+    gvz    = macro.get("gvz", {})
+    oil    = macro.get("oil", {})
+    btc    = macro.get("btc", {})
     cal    = market_data.get("economic_calendar", [])
 
     cal_str = (
@@ -88,6 +100,15 @@ async def run_macro_scout(market_data: dict, memory_context: str) -> dict:
         .replace("{vix_current}",   str(vix.get("current",     "N/A")))
         .replace("{vix_direction}", str(vix.get("direction",   "UNKNOWN")))
         .replace("{vix_change}",    str(vix.get("change_pct",  "N/A")))
+        .replace("{gvz_current}",   str(gvz.get("current",     "N/A")))
+        .replace("{gvz_direction}", str(gvz.get("direction",   "UNKNOWN")))
+        .replace("{gvz_change}",    str(gvz.get("change_pct",  "N/A")))
+        .replace("{oil_current}",   str(oil.get("current",     "N/A")))
+        .replace("{oil_direction}", str(oil.get("direction",   "UNKNOWN")))
+        .replace("{oil_change}",    str(oil.get("change_pct",  "N/A")))
+        .replace("{btc_current}",   str(btc.get("current",     "N/A")))
+        .replace("{btc_direction}", str(btc.get("direction",   "UNKNOWN")))
+        .replace("{btc_change}",    str(btc.get("change_pct",  "N/A")))
         .replace("{economic_calendar}", cal_str)
         .replace("{memory_context}", memory_context)
     )

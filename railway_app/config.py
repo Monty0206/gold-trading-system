@@ -27,13 +27,28 @@ HARD_RULES = {
 # All OpenRouter model slugs in one place — agents import MODEL from here.
 # Never hard-code model strings in agent files.
 MODELS = {
-    "macro_scout":      "anthropic/claude-sonnet-4-6",
-    "technical_analyst": "anthropic/claude-opus-4-6",
-    "quant_reasoner":   "deepseek/deepseek-chat",   # V3: fast arithmetic, no slow R1 reasoning
-    "bull_bear_debate": "google/gemini-2.5-pro",
-    "risk_manager":     "deepseek/deepseek-chat",
-    "final_executor":   "anthropic/claude-opus-4-6",
+    "macro_scout":        "perplexity/sonar-reasoning",   # was claude-sonnet-4-6 — now has live web
+    "technical_analyst":  "anthropic/claude-opus-4-5",    # keep Opus for hardest reasoning
+    "quant_reasoner":     None,                            # LLM removed — pure Python now
+    "bull_advocate":      "openai/gpt-4o",                 # heterogeneous debate
+    "bear_advocate":      "anthropic/claude-sonnet-4-5",   # best at risk identification
+    "debate_adjudicator": "google/gemini-2.5-pro",        # neutral arbitration
+    "risk_manager":       None,                            # LLM removed — pure Python guardrails
+    "final_executor":     "anthropic/claude-sonnet-4-5",  # downgraded from Opus — mechanical synthesis
+    "news_sentiment":     "perplexity/sonar-pro",         # NEW agent
+    "pattern_history":    "anthropic/claude-sonnet-4-5",  # NEW agent
 }
+
+# Volatility regime thresholds (ATR-based, in pips)
+REGIME_LOW_VOL_ATR    = 8.0
+REGIME_HIGH_VOL_ATR   = 20.0
+REGIME_EXTREME_ATR    = 35.0
+
+# Minimum confluence by regime
+REGIME_CONFLUENCE_MIN = {"LOW": 4, "NORMAL": 4, "HIGH": 5, "EXTREME": 6}
+
+# Lot size multiplier by regime
+REGIME_LOT_MULTIPLIER = {"LOW": 1.0, "NORMAL": 1.0, "HIGH": 0.75, "EXTREME": 0.5}
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")

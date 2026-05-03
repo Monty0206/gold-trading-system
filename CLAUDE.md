@@ -222,10 +222,44 @@ CREATE INDEX idx_patterns_session ON market_patterns(session);
 
 ---
 
+### MODEL ASSIGNMENTS (current — see `railway_app/config.py`)
+
+| Agent              | Model                            | Notes                                       |
+|--------------------|----------------------------------|---------------------------------------------|
+| macro_scout        | `perplexity/sonar-reasoning`     | live web search                             |
+| technical_analyst  | `anthropic/claude-opus-4-5`      | hardest reasoning                           |
+| quant_reasoner     | None — pure Python               | deterministic math                          |
+| bull_advocate      | `openai/gpt-4o`                  | heterogeneous debate                        |
+| bear_advocate      | `anthropic/claude-sonnet-4-5`    | risk identification                         |
+| debate_adjudicator | `google/gemini-2.5-pro`          | neutral arbitration                         |
+| risk_manager       | None — pure Python               | hard rules only                             |
+| final_executor     | `anthropic/claude-sonnet-4-5`    | mechanical synthesis                        |
+| news_sentiment     | `perplexity/sonar-pro`           | live news / sentiment                       |
+| pattern_history    | `anthropic/claude-sonnet-4-5`    | reserved                                    |
+
+### NEW AGENTS (post-transformation)
+
+- **`agents/news_sentiment.py`** — Live news + sentiment via Perplexity web search (last 6h
+  headlines, Fed tone, geopolitical risk). Votes RED/GREEN based on sentiment label, or
+  YELLOW if `trade_caution=True`. Trade is aborted in `main.py` when caution+RED.
+- **`agents/volatility_regime.py`** — Pure-Python ATR-based regime classifier. Reads M15
+  candles (or live ATR) and emits `regime` ∈ {LOW, NORMAL, HIGH, EXTREME} plus a
+  `lot_multiplier` and dynamic `min_confluence` threshold. Wired into the Quant Reasoner
+  (lot reduction) and the Risk Manager (confluence override).
+- **`agents/correlation_agent.py`** — Pure-Python coherence check across DXY/Yields/VIX/GVZ
+  vs the macro_scout bias. Returns `aligned_count` / `total_signals` and a probability
+  `confidence_modifier`. Surfaces context to the Final Executor.
+
+### LOT-SIZING SAFETY (CHANGE 2 — critical)
+
+`quant_reasoner._compute_lot_size` rounds DOWN to lot_step (never up). If the broker
+minimum lot would risk **more than 2x** the configured `RISK_PCT`, the trade is REJECTED
+(lot=0.0, abort=True) rather than silently over-leveraging a small account. This is the
+single most important risk fix in v2.0.
+
 ### AGENT 1 — MACRO SCOUT
 **File:** `railway_app/agents/macro_scout.py`
-**Model:** `anthropic/claude-sonnet-4-6`
-**Web search:** ENABLED
+**Model:** `perplexity/sonar-reasoning` (live web search)
 **Temperature:** 0.1
 
 **System Prompt:**
@@ -281,7 +315,7 @@ Vote RED = major news within 2 hours OR completely conflicting signals
 
 ### AGENT 2 — TECHNICAL ANALYST
 **File:** `railway_app/agents/technical_analyst.py`
-**Model:** `anthropic/claude-opus-4-6`
+**Model:** `anthropic/claude-opus-4-5`
 **Temperature:** 0.1
 
 **System Prompt:**
@@ -381,11 +415,10 @@ Vote RED = NO_SETUP or confluence below 3
 
 ---
 
-### AGENT 3 — QUANT REASONER
+### AGENT 3 — QUANT REASONER (PURE PYTHON, NO LLM)
 **File:** `railway_app/agents/quant_reasoner.py`
-**Model:** `deepseek/deepseek-r1`
-**Temperature:** 0.1
-**Cost:** FREE on OpenRouter
+**Model:** None — deterministic Python only
+**Cost:** $0
 
 **System Prompt:**
 ```
@@ -453,11 +486,16 @@ Vote RED = probability < 55 OR macro/technical disagree OR math errors
 
 ---
 
-### AGENT 4 — BULL vs BEAR DEBATE
+### AGENT 4 — BULL vs BEAR DEBATE (heterogeneous models)
 **File:** `railway_app/agents/bull_bear_debate.py`
-**Model:** `google/gemini-2.5-pro`
+**Models:**
+  - Bull advocate: `openai/gpt-4o`
+  - Bear advocate: `anthropic/claude-sonnet-4-5`
+  - Adjudicator:   `google/gemini-2.5-pro`
 **Temperature:** 0.2
-**Special:** Makes THREE separate API calls — Bull, Bear, then Adjudicator
+**Special:** THREE separate API calls — each side uses a different model so the debate
+isn't biased by shared pretraining. Critical fields are serialized first into a 3000-char
+budget so they're never truncated.
 
 **Bull Prompt:**
 ```
@@ -516,11 +554,11 @@ Vote RED = BEAR wins OR LOW conviction
 
 ---
 
-### AGENT 5 — RISK MANAGER
+### AGENT 5 — RISK MANAGER (PURE PYTHON, NO LLM)
 **File:** `railway_app/agents/risk_manager.py`
-**Model:** `deepseek/deepseek-chat`
-**Temperature:** 0.0
-**Note:** Hard rules checked in Python FIRST, AI confirms second
+**Model:** None — pure Python hard-rules gatekeeper
+**Note:** All checks are non-negotiable Python rules. The volatility_regime agent feeds
+its dynamic `min_confluence` threshold via `min_confluence_override`.
 
 **Python Hard Rules (non-negotiable):**
 ```python
@@ -582,7 +620,7 @@ Only GREEN if APPROVED. RED if any concern. No exceptions.
 
 ### AGENT 6 — FINAL EXECUTOR
 **File:** `railway_app/agents/final_executor.py`
-**Model:** `anthropic/claude-opus-4-6`
+**Model:** `anthropic/claude-sonnet-4-5` (downgraded from Opus — task is mechanical synthesis)
 **Temperature:** 0.1
 
 **System Prompt:**
